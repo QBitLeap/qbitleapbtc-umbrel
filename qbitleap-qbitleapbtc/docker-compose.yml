@@ -12,10 +12,39 @@ services:
     volumes:
       - ./web:/usr/share/nginx/html:ro
 
+  qbit_config:
+    image: alpine:3.21
+    restart: "no"
+    volumes:
+      - ${APP_DATA_DIR}/config:/config
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+
+        mkdir -p /config
+
+        cat > /config/qbit.conf <<'EOF'
+        # QBitLeap managed configuration
+
+        server=1
+        txindex=1
+        rpcbind=0.0.0.0
+        zmqpubrawblock=tcp://0.0.0.0:28332
+        zmqpubrawtx=tcp://0.0.0.0:28333
+        EOF
+
+        chmod 600 /config/qbit.conf
+
   qbitd:
     image: ghcr.io/qbitleap/qbitleapbtc-qbitd:0.1.0
     restart: unless-stopped
     stop_grace_period: 2m
+
+    depends_on:
+      qbit_config:
+        condition: service_completed_successfully
 
     environment:
       QBIT_PRODUCTION: "1"
@@ -47,7 +76,7 @@ services:
       - "8355:8355"
 
     volumes:
-      - ./config/qbit/qbit.conf:/etc/qbit/qbit.conf:ro
+      - ${APP_DATA_DIR}/config/qbit.conf:/etc/qbit/qbit.conf:ro
       - ${APP_DATA_DIR}/qbit:/var/lib/qbit
 
     healthcheck:
