@@ -27,7 +27,8 @@ gallery: []
 releaseNotes: >-
   Initial Umbrel application wrapper.
 
-dependencies: []
+dependencies:
+  - bitcoin
 
 path: ""
 defaultUsername: ""
