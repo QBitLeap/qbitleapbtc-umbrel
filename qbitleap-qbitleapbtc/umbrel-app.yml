@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.2.1"
+version: "0.2.2"
 port: 3000
 
 description: >-
@@ -25,7 +25,9 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 gallery: []
 
 releaseNotes: >-
-  Attempt frontend landing page fix
+  Replaces nginx with the QBitLeap dashboard and adds Qbit Core and CKPool status,
+  persistent QBT and BTC payout-address configuration, QBT block count, and the
+  permissionless CKPool Stratum service on port 3333.
 
 dependencies:
   - bitcoin
