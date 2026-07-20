@@ -1,1 +1,34 @@
+manifestVersion: 1
 
+id: qbitleap-qbitleapbtc
+name: QBitLeap BTC
+tagline: Run Qbit merge mining on Umbrel
+icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
+category: Bitcoin
+version: "0.1.0"
+port: 3000
+
+description: >-
+  QBitLeap BTC packages Qbit's official qbit-mining-bootstrap project
+  as an Umbrel-friendly application with minimal upstream modifications.
+
+  The app is intended to run the Qbit merge-mining stack through Umbrel,
+  with persistent data, miner configuration, and live operational status.
+
+developer: QBitLeap
+website: https://github.com/Qbit-Foundation/qbit-mining-bootstrap
+submitter: QBitLeap
+submission: https://github.com/qbitleap/qbitleapbtc-umbrel
+repo: https://github.com/qbitleap/qbitleapbtc-umbrel
+support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
+
+gallery: []
+
+releaseNotes: >-
+  Initial Umbrel application wrapper.
+
+dependencies: []
+
+path: ""
+defaultUsername: ""
+defaultPassword: ""
