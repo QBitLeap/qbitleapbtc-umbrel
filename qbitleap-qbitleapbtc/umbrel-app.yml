@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.1.8"
+version: "0.2.0"
 port: 3000
 
 description: >-
@@ -25,7 +25,7 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 gallery: []
 
 releaseNotes: >-
-  Restores 0.1.5 version of docker-compose.yml
+  Marks 0.2.0 version as stable app, with nginx landing page that needs to be troubleshot
 
 dependencies:
   - bitcoin
