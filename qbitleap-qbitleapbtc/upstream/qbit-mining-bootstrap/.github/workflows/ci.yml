@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Lint, compile, and test
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install lint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+
+      - name: Check shell syntax
+        run: git ls-files '*.sh' | xargs bash -n
+
+      - name: ShellCheck shell scripts
+        run: |
+          touch .env
+          git ls-files '*.sh' | xargs shellcheck -x
+
+      - name: Compile Python sources
+        run: python -m compileall -q docker lab tests examples scripts
+
+      - name: Run Python unit tests
+        run: python -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Run Postgres ledger integration tests
+        run: make test-prism-postgres-ledger
+
+      - name: Validate mainnet Compose contract
+        run: python -m unittest tests.test_mainnet_compose_contract
+
+      - name: Run Rust tests
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Validate Docker Compose files
+        run: |
+          export QBIT_SRC_DIR="$PWD"
+          export PRISM_STRATUM_PORT_HOST=127.0.0.1:43340
+          export PRISM_STRATUM_PORT=43340
+          for profile in permissionless real-miner-smoke auxpow prism; do
+            docker compose \
+              --env-file config/upstream.env.example \
+              --env-file .env.example \
+              -f compose.yaml \
+              --profile "$profile" \
+              config --quiet
+          done
+
+  docker-builds:
+    name: Build lightweight Docker images
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@v1
+
+      - name: Create qbit functional-test build context
+        run: mkdir -p /tmp/qbit-functional-fixture/test/functional
+
+      - name: Build miner simulator image
+        run: docker build -f lab/miner-sim/Dockerfile .
+
+      - name: Build AuxPoW coordinator image
+        run: |
+          docker buildx build \
+            --build-context qbit-src=/tmp/qbit-functional-fixture \
+            --load \
+            -f lab/auxpow/Dockerfile \
+            .
+
+      - name: Build PRISM coordinator image
+        run: |
+          docker buildx build \
+            --build-context qbit-src=/tmp/qbit-functional-fixture \
+            --load \
+            -f lab/prism/Dockerfile \
+            .
+
+  qbit-runtime-image:
+    name: Build and smoke real qbitd image
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 30
+    env:
+      QBIT_CI_COMMIT: 7ebcddb622d6e639041f005a189b048ec2a221fe
+      QBIT_CI_IMAGE: qbit-lab-qbitd:ci
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@v1
+
+      - name: Stage pinned qbit source
+        run: |
+          set -euo pipefail
+          qbit_git="${RUNNER_TEMP}/qbit-git"
+          qbit_src="${RUNNER_TEMP}/qbit-src"
+          mkdir -p "${qbit_git}" "${qbit_src}"
+          git -C "${qbit_git}" init --quiet
+          git -C "${qbit_git}" remote add origin https://github.com/Qbit-Org/qbit.git
+          git -C "${qbit_git}" fetch --depth=1 origin "${QBIT_CI_COMMIT}"
+          resolved_commit="$(git -C "${qbit_git}" rev-parse FETCH_HEAD)"
+          if [[ "${resolved_commit}" != "${QBIT_CI_COMMIT}" ]]; then
+            printf 'qbit source resolved %s, expected %s\n' \
+              "${resolved_commit}" "${QBIT_CI_COMMIT}" >&2
+            exit 1
+          fi
+          git -C "${qbit_git}" archive "${resolved_commit}" | tar -x -C "${qbit_src}"
+          printf 'qbit CI source: %s\n' "${resolved_commit}"
+
+      - name: Build real qbitd image
+        run: |
+          docker buildx build \
+            --build-context qbit-src="${RUNNER_TEMP}/qbit-src" \
+            --load \
+            --tag "${QBIT_CI_IMAGE}" \
+            -f docker/qbit/Dockerfile \
+            .
+
+      - name: Smoke real qbitd runtime
+        run: bash .github/scripts/test-qbit-image-runtime.sh
