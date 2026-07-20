@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.1.2"
+version: "0.1.3"
 port: 3000
 
 description: >-
@@ -25,8 +25,7 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 gallery: []
 
 releaseNotes: >-
-  Adds Qbit Core with persistent blockchain storage and mainnet
-  peer connectivity.
+  Fixes Qbit Core configuration creation and mounting during startup.
 
 dependencies:
   - bitcoin
