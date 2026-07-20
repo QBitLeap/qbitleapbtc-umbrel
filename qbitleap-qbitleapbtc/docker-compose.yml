@@ -8,12 +8,59 @@ services:
 
   web:
     image: nginx:1.27-alpine
-    restart: unless-stopped
-
+    restart: on-failure
     volumes:
       - ./web:/usr/share/nginx/html:ro
 
-      # Persistent application data
-      - ${APP_DATA_DIR}/config:/data/config
-      - ${APP_DATA_DIR}/logs:/data/logs
-      - ${APP_DATA_DIR}/qbit:/data/qbit
+  qbitd:
+    image: ghcr.io/qbitleap/qbitleapbtc-qbitd:0.1.0
+    restart: unless-stopped
+    stop_grace_period: 2m
+
+    environment:
+      QBIT_PRODUCTION: "1"
+      QBIT_TOOLS_PRODUCTION: "1"
+      QBIT_CHAIN: mainnet
+      CKPOOL_NON_TEST_READINESS_GATE: "1"
+      QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED: "1"
+
+    command:
+      - -printtoconsole
+      - -conf=/etc/qbit/qbit.conf
+      - -datadir=/var/lib/qbit
+      - -rpcuser=qbitrpc
+      - -rpcpassword=${APP_PASSWORD}
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=127.0.0.1
+      - -rpcallowip=10.0.0.0/8
+      - -rpcallowip=172.16.0.0/12
+      - -rpcallowip=192.168.0.0/16
+      - -rpcworkqueue=64
+      - -rpcport=8352
+      - -port=8355
+      - -listen=1
+      - -fallbackfee=0.00001000
+      - -chain=main
+      - -asert
+
+    ports:
+      - "8355:8355"
+
+    volumes:
+      - ./config/qbit/qbit.conf:/etc/qbit/qbit.conf:ro
+      - ${APP_DATA_DIR}/qbit:/var/lib/qbit
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          qbit-cli
+          -rpcconnect=127.0.0.1
+          -rpcport=8352
+          -rpcuser=qbitrpc
+          -rpcpassword="${APP_PASSWORD}"
+          getblockchaininfo >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
