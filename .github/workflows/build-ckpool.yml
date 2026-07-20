@@ -35,7 +35,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          source source qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap/upstream.env
+          source qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap/upstream.env
           echo "git_url=${CKPOOL_GIT_URL}" >> "$GITHUB_OUTPUT"
           echo "git_ref=${CKPOOL_GIT_REF}" >> "$GITHUB_OUTPUT"
 
