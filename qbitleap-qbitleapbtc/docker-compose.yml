@@ -8,6 +8,12 @@ services:
 
   web:
     image: nginx:1.27-alpine
-    restart: on-failure
+    restart: unless-stopped
+
     volumes:
       - ./web:/usr/share/nginx/html:ro
+
+      # Persistent application data
+      - ${APP_DATA_DIR}/config:/data/config
+      - ${APP_DATA_DIR}/logs:/data/logs
+      - ${APP_DATA_DIR}/qbit:/data/qbit
