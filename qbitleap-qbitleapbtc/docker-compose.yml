@@ -8,12 +8,8 @@ services:
       PROXY_AUTH_ADD: "false"
 
   dashboard:
-    image: python:3.12-alpine
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.2.3
     restart: unless-stopped
-    working_dir: /app
-    command:
-      - python
-      - /app/server.py
     environment:
       DASHBOARD_PORT: "8080"
       QBIT_RPC_HOST: qbitd
@@ -25,7 +21,6 @@ services:
       CONFIG_DIR: /config
       CKPOOL_LOG_DIR: /var/log/ckpool
     volumes:
-      - ./dashboard:/app:ro
       - ${APP_DATA_DIR}/config:/config
       - ${APP_DATA_DIR}/ckpool/logs:/var/log/ckpool:ro
     depends_on:
@@ -45,7 +40,7 @@ services:
 
         mkdir -p /config
 
-        cat > /config/qbit.conf <<'EOF'
+        cat > /config/qbit.conf <<'EOF_CONFIG'
         # QBitLeap managed configuration
 
         server=1
@@ -53,7 +48,7 @@ services:
         rpcbind=0.0.0.0
         zmqpubrawblock=tcp://0.0.0.0:28332
         zmqpubrawtx=tcp://0.0.0.0:28333
-        EOF
+        EOF_CONFIG
 
         touch /config/qbt-payout-address.txt
         touch /config/btc-payout-address.txt
@@ -119,7 +114,7 @@ services:
       start_period: 30s
 
   ckpool:
-    image: ghcr.io/qbitleap/qbitleapbtc-ckpool:0.2.2
+    image: ghcr.io/qbitleap/qbitleapbtc-ckpool:0.2.3
     restart: unless-stopped
 
     depends_on:
@@ -135,9 +130,8 @@ services:
       QBIT_RPC_PORT: "8352"
       QBIT_RPC_USER: qbitrpc
       QBIT_RPC_PASSWORD: ${APP_PASSWORD}
-      QBIT_MINER_ADDRESS: auto
       QBIT_MINER_ADDRESS_FILE: /config/qbt-payout-address.txt
-      QBIT_MINER_ADDRESS_FILE_WAIT: "1"
+      QBIT_MINER_ADDRESS_POLL_SECONDS: "2"
       CKPOOL_LOG_DIR: /var/log/ckpool
       CKPOOL_STATE_DIR: /var/lib/ckpool
       CKPOOL_SOCK_DIR: /tmp/qbitleap
