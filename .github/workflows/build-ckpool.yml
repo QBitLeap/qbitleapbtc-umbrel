@@ -9,6 +9,7 @@ permissions:
 
 env:
   UPSTREAM_DIR: qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap
+  UPSTREAM_ENV: qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap/upstream.env
   IMAGE_NAME: ghcr.io/qbitleap/qbitleapbtc-ckpool
 
 jobs:
@@ -19,6 +20,26 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Load pinned CKPool source
+        id: ckpool
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ENV_FILE="${GITHUB_WORKSPACE}/${UPSTREAM_ENV}"
+
+          echo "Loading CKPool source settings from:"
+          echo "${ENV_FILE}"
+
+          test -f "${ENV_FILE}"
+          source "${ENV_FILE}"
+
+          test -n "${CKPOOL_GIT_URL:-}"
+          test -n "${CKPOOL_GIT_REF:-}"
+
+          echo "git_url=${CKPOOL_GIT_URL}" >> "${GITHUB_OUTPUT}"
+          echo "git_ref=${CKPOOL_GIT_REF}" >> "${GITHUB_OUTPUT}"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -28,16 +49,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Load pinned CKPool source
-        id: ckpool
-        working-directory: ${{ env.UPSTREAM_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          source qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap/upstream.env
-          echo "git_url=${CKPOOL_GIT_URL}" >> "$GITHUB_OUTPUT"
-          echo "git_ref=${CKPOOL_GIT_REF}" >> "$GITHUB_OUTPUT"
 
       - name: Build and publish CKPool
         uses: docker/build-push-action@v7
