@@ -95,7 +95,7 @@ jobs:
             CKPOOL_GIT_URL=${{ steps.ckpool.outputs.git_url }}
             CKPOOL_GIT_REF=${{ steps.ckpool.outputs.git_ref }}
           tags: |
-            ${{ env.IMAGE_NAME }}:0.2.5
+            ${{ env.IMAGE_NAME }}:0.2.6
             ${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
