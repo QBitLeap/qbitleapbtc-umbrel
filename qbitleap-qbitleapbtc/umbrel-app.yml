@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.2.4"
+version: "0.2.5"
 port: 3000
 
 description: >-
@@ -25,9 +25,8 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 gallery: []
 
 releaseNotes: >-
-  Packages the dashboard as a dedicated container image and adds an Umbrel CKPool
-  startup wrapper that waits for the saved QBT payout address before launching the
-  upstream CKPool process. needed to be pushed to 0.2.4
+  Updated dashboard branding to QBitLeapBTC.
+  Synchronized application and container image versions.
 
 dependencies:
   - bitcoin

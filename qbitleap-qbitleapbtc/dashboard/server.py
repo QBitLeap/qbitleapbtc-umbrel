@@ -137,7 +137,7 @@ def render(message="", error=""):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>QBitLeap Solo Miner</title>
+<title>QBitleapBTC</title>
 <style>
 :root {{
   color-scheme: dark;
@@ -165,7 +165,7 @@ button {{ border:0; border-radius:9px; padding:11px 20px; background:var(--accen
 </head>
 <body>
 <main>
-<h1>QBitLeap Solo Miner</h1>
+<h1>QBitLeapBTC</h1>
 {notice}
 <section class="card">
 <form method="post" action="/save">
