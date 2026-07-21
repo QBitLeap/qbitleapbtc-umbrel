@@ -69,6 +69,7 @@ jobs:
           test -f "${UPSTREAM_DIR}/docker/ckpool/ckpool-version-mask.py"
           test -f "${UPSTREAM_DIR}/docker/ckpool/qbit-ckpool-preflight.py"
           test -f "${UPSTREAM_DIR}/docker/ckpool/start-ckpool.sh"
+          test -f "${UPSTREAM_DIR}/docker/ckpool/start-ckpool-umbrel.sh"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -91,7 +92,7 @@ jobs:
             CKPOOL_GIT_URL=${{ steps.ckpool.outputs.git_url }}
             CKPOOL_GIT_REF=${{ steps.ckpool.outputs.git_ref }}
           tags: |
-            ${{ env.IMAGE_NAME }}:0.2.2
+            ${{ env.IMAGE_NAME }}:0.2.3
             ${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max

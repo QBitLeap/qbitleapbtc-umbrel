@@ -1,0 +1,51 @@
+name: Build dashboard image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  DASHBOARD_DIR: qbitleap-qbitleapbtc/dashboard
+  IMAGE_NAME: ghcr.io/qbitleap/qbitleapbtc-dashboard
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Verify dashboard build files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "${DASHBOARD_DIR}/Dockerfile"
+          test -f "${DASHBOARD_DIR}/server.py"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish dashboard
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.DASHBOARD_DIR }}
+          file: ${{ env.DASHBOARD_DIR }}/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:0.2.3
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

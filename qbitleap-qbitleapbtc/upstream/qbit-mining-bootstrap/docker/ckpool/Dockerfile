@@ -56,8 +56,9 @@ COPY --from=build /src/ckpool/src/ckpool /usr/local/bin/ckpool
 COPY docker/ckpool/ckpool-version-mask.py /usr/local/bin/ckpool-version-mask
 COPY docker/ckpool/qbit-ckpool-preflight.py /usr/local/bin/qbit-ckpool-preflight
 COPY docker/ckpool/start-ckpool.sh /usr/local/bin/start-ckpool.sh
+COPY docker/ckpool/start-ckpool-umbrel.sh /usr/local/bin/start-ckpool-umbrel.sh
 
-RUN chmod +x /usr/local/bin/ckpool-version-mask /usr/local/bin/qbit-ckpool-preflight /usr/local/bin/start-ckpool.sh
+RUN chmod +x /usr/local/bin/ckpool-version-mask /usr/local/bin/qbit-ckpool-preflight /usr/local/bin/start-ckpool.sh /usr/local/bin/start-ckpool-umbrel.sh
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/usr/local/bin/start-ckpool.sh"]
+CMD ["/usr/local/bin/start-ckpool-umbrel.sh"]
