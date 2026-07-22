@@ -152,14 +152,16 @@ def state_badge(ok, yes_text, no_text):
     return f'<span class="state {cls}">{icon} {html.escape(text)}</span>'
 
 
-def service_row(name, active, active_text, inactive_text, secondary=None):
+def service_row(name, active, status):
     dot_class = "up" if active else "down"
-    second = f"<span>{secondary}</span>" if secondary else ""
     return (
         '<div class="service-row">'
-        f'<span class="service-name"><span class="service-dot {dot_class}"></span>{html.escape(name)}</span>'
-        f'<span class="service-states">{state_badge(active, active_text, inactive_text)}{second}</span>'
-        "</div>"
+        '<span class="service-line">'
+        f'<span class="service-dot {dot_class}"></span>'
+        f'<span>{html.escape(name)}</span>'
+        f'<span class="service-status">{html.escape(status)}</span>'
+        '</span>'
+        '</div>'
     )
 
 
@@ -198,19 +200,20 @@ h1 {{ font-size:28px; margin:0; }}
 .card {{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:22px; margin-bottom:18px; }}
 h2 {{ margin:0; font-size:17px; }}
 details.card {{ padding:0; }}
-summary {{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:22px; cursor:pointer; list-style:none; user-select:none; }}
+summary {{ position:relative; display:flex; align-items:center; justify-content:center; gap:12px; padding:22px; cursor:pointer; list-style:none; user-select:none; text-align:center; }}
 summary::-webkit-details-marker {{ display:none; }}
-summary::after {{ content:"▸"; color:var(--muted); font-size:18px; transition:transform .15s ease; }}
+summary::after {{ content:"▸"; position:absolute; right:22px; color:var(--muted); font-size:18px; transition:transform .15s ease; }}
 details[open] > summary::after {{ transform:rotate(90deg); }}
 .card-body {{ padding:0 22px 22px; }}
 label {{ display:block; font-weight:600; margin:0 0 8px; }}
 input {{ width:100%; border:1px solid var(--line); border-radius:9px; padding:12px; margin-bottom:18px; background:#0e141e; color:var(--text); font:inherit; }}
 button, .refresh {{ border:0; border-radius:9px; padding:10px 16px; background:var(--accent); color:#08101f; font:inherit; font-weight:700; cursor:pointer; text-decoration:none; }}
-.service-row, .metric-row {{ display:flex; justify-content:space-between; align-items:center; gap:18px; padding:12px 0; }}
+.service-row {{ display:flex; justify-content:center; align-items:center; padding:12px 0; text-align:center; }}
+.metric-row {{ display:flex; justify-content:space-between; align-items:center; gap:18px; padding:12px 0; }}
 .service-row + .service-row, .metric-row + .metric-row {{ border-top:1px solid var(--line); }}
-.service-name {{ display:flex; align-items:center; gap:10px; font-weight:650; }}
+.service-line {{ display:inline-flex; align-items:center; justify-content:center; gap:10px; font-weight:650; text-align:center; }}
 .service-dot {{ width:12px; height:12px; border-radius:3px; background:currentColor; flex:0 0 auto; }}
-.service-states {{ display:flex; justify-content:flex-end; gap:14px; flex-wrap:wrap; text-align:right; }}
+.service-status {{ font-weight:600; }}
 .state {{ font-weight:600; white-space:nowrap; }}
 .up {{ color:var(--good); }} .down {{ color:var(--bad); }}
 .metric-value {{ font-weight:700; }}
@@ -219,8 +222,8 @@ button, .refresh {{ border:0; border-radius:9px; padding:10px 16px; background:v
 .success {{ background:#123522; color:#8ce7b2; }} .error {{ background:#3a181c; color:#ff9ca5; }}
 .footer {{ color:var(--muted); font-size:12px; text-align:center; }}
 @media (max-width:620px) {{
-  .service-row, .metric-row {{ align-items:flex-start; }}
-  .service-states {{ flex-direction:column; gap:4px; }}
+  .metric-row {{ align-items:flex-start; }}
+  .service-line {{ flex-wrap:wrap; }}
 }}
 </style>
 </head>
@@ -231,10 +234,10 @@ button, .refresh {{ border:0; border-radius:9px; padding:10px 16px; background:v
 <details class="card" open>
 <summary><h2>Mining Services</h2></summary>
 <div class="card-body">
-{service_row(f"Qbit Core - Block {qbit_height:,}" if qbit_height is not None else "Qbit Core", qbit_up, "Running", "Not Running")}
-{service_row("CKPool", ckpool_up, "Connected", "Not Connected", state_badge(ckpool_up and bool(read_text(QBT_FILE)), "Mining Ready", "Not Ready"))}
-{service_row(f"Bitcoin Core - Block {bitcoin_height:,}" if bitcoin_height is not None else "Bitcoin Core", bitcoin_up, "Running", "Not Running")}
-{service_row("BTC Solo Mine", False, "Connected", "Not Connected", state_badge(False, "Mining", "Not Mining"))}
+{service_row("Qbit Core", qbit_up, f"Block {qbit_height:,}" if qbit_height is not None else "Not Running")}
+{service_row("CKPool", ckpool_up, "Connected" if ckpool_up else "Not Connected")}
+{service_row("Bitcoin Core", bitcoin_up, f"Block {bitcoin_height:,}" if bitcoin_height is not None else "Not Running")}
+{service_row("BTC Solo Mine", False, "Not Connected")}
 </div>
 </details>
 <details class="card" open>
