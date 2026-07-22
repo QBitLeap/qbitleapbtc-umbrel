@@ -118,7 +118,7 @@ services:
       start_period: 30s
 
   auxpow:
-    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.4.1
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.4.2
     restart: unless-stopped
 
     depends_on:
@@ -152,6 +152,7 @@ services:
       AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT: "0"
       AUXPOW_STRATUM_STATS_INTERVAL_SECONDS: "60"
       QBIT_CHAIN: mainnet
+      QBIT_EXPECTED_GENESIS_HASH: 0000000000004d60aa5d46013991d0a0e2995d89ee98e53068ae196d763e79f2
       QBIT_RPC_HOST: qbitd
       QBIT_RPC_PORT: "8352"
       QBIT_RPC_USER: qbitrpc
