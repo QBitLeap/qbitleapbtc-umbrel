@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.2.6"
+version: "0.2.7"
 port: 8080
 
 description: >-
@@ -25,7 +25,7 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 gallery: []
 
 releaseNotes: >-
-  Change umbrel-app.yml port from 3000 to 8080
+  Connect the dashboard to the required Umbrel Bitcoin Node, validate BTC payout addresses through Bitcoin Core RPC, and refresh status every five minutes.
 
 dependencies:
   - bitcoin

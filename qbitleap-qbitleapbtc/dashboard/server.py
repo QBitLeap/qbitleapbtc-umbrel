@@ -6,6 +6,7 @@ import os
 import re
 import socket
 import tempfile
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -23,6 +24,11 @@ QBIT_RPC_USER = os.environ.get("QBIT_RPC_USER", "qbitrpc")
 QBIT_RPC_PASSWORD = os.environ.get("QBIT_RPC_PASSWORD", "")
 CKPOOL_HOST = os.environ.get("CKPOOL_HOST", "ckpool")
 CKPOOL_PORT = int(os.environ.get("CKPOOL_PORT", "3333"))
+
+BITCOIN_RPC_HOST = os.environ.get("BITCOIN_RPC_HOST", "")
+BITCOIN_RPC_PORT = int(os.environ.get("BITCOIN_RPC_PORT", "8332"))
+BITCOIN_RPC_USER = os.environ.get("BITCOIN_RPC_USER", "")
+BITCOIN_RPC_PASSWORD = os.environ.get("BITCOIN_RPC_PASSWORD", "")
 
 ADDRESS_RE = re.compile(r"^[A-Za-z0-9]{14,120}$")
 
@@ -51,40 +57,68 @@ def atomic_write(path, value):
             pass
 
 
-def qbit_rpc(method, params=None):
+def rpc_call(host, port, user, password, method, params=None):
+    if not host or not user or not password:
+        raise RuntimeError("RPC connection is not configured")
     payload = json.dumps({
         "jsonrpc": "1.0",
         "id": "qbitleap-dashboard",
         "method": method,
         "params": params or [],
     }).encode("utf-8")
-    auth = base64.b64encode(
-        f"{QBIT_RPC_USER}:{QBIT_RPC_PASSWORD}".encode("utf-8")
-    ).decode("ascii")
+    auth = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
     req = Request(
-        f"http://{QBIT_RPC_HOST}:{QBIT_RPC_PORT}",
+        f"http://{host}:{port}",
         data=payload,
         headers={
             "Authorization": f"Basic {auth}",
             "Content-Type": "application/json",
         },
     )
-    with urlopen(req, timeout=3) as response:
+    with urlopen(req, timeout=4) as response:
         body = json.load(response)
     if body.get("error"):
         raise RuntimeError(str(body["error"]))
     return body.get("result")
 
 
-def qbit_running():
+def qbit_rpc(method, params=None):
+    return rpc_call(
+        QBIT_RPC_HOST,
+        QBIT_RPC_PORT,
+        QBIT_RPC_USER,
+        QBIT_RPC_PASSWORD,
+        method,
+        params,
+    )
+
+
+def bitcoin_rpc(method, params=None):
+    return rpc_call(
+        BITCOIN_RPC_HOST,
+        BITCOIN_RPC_PORT,
+        BITCOIN_RPC_USER,
+        BITCOIN_RPC_PASSWORD,
+        method,
+        params,
+    )
+
+
+def chain_status(rpc):
     try:
-        qbit_rpc("getblockchaininfo")
-        return True
+        info = rpc("getblockchaininfo")
+        synced = bool(
+            isinstance(info, dict)
+            and not info.get("initialblockdownload", True)
+            and float(info.get("verificationprogress", 0)) >= 0.9999
+            and int(info.get("blocks", -1)) >= int(info.get("headers", 0))
+        )
+        return True, synced
     except Exception:
-        return False
+        return False, False
 
 
-def ckpool_running():
+def ckpool_connected():
     try:
         with socket.create_connection((CKPOOL_HOST, CKPOOL_PORT), timeout=2):
             return True
@@ -93,7 +127,6 @@ def ckpool_running():
 
 
 def qbit_blocks_found():
-    # CKPool records solved-block events in its persistent logs.
     patterns = (
         re.compile(r"\bsolved\b.*\bblock\b", re.I),
         re.compile(r"\bblock\b.*\bsolved\b", re.I),
@@ -101,7 +134,7 @@ def qbit_blocks_found():
     )
     seen = set()
     try:
-        files = [p for p in CKPOOL_LOG_DIR.rglob("*") if p.is_file()]
+        files = [path for path in CKPOOL_LOG_DIR.rglob("*") if path.is_file()]
     except OSError:
         return 0
     for path in files:
@@ -115,29 +148,52 @@ def qbit_blocks_found():
     return len(seen)
 
 
-def status_label(up):
-    cls = "up" if up else "down"
-    text = "Running" if up else "Not Running"
-    return f'<span class="status {cls}"><span class="dot"></span>{text}</span>'
+def state_badge(ok, yes_text, no_text):
+    cls = "up" if ok else "down"
+    text = yes_text if ok else no_text
+    icon = "✅" if ok else "❌"
+    return f'<span class="state {cls}">{icon} {html.escape(text)}</span>'
 
 
-def render(message="", error=""):
+def service_row(name, active, active_text, inactive_text, secondary=None):
+    dot_class = "up" if active else "down"
+    second = f"<span>{secondary}</span>" if secondary else ""
+    return (
+        '<div class="service-row">'
+        f'<span class="service-name"><span class="service-dot {dot_class}"></span>{html.escape(name)}</span>'
+        f'<span class="service-states">{state_badge(active, active_text, inactive_text)}{second}</span>'
+        "</div>"
+    )
+
+
+def connection_mode(headers):
+    host = headers.get("X-Forwarded-Host") or headers.get("Host", "")
+    return "Remotely" if ".onion" in host.lower() else "Locally"
+
+
+def render(headers, message="", error=""):
     qbt = html.escape(read_text(QBT_FILE), quote=True)
     btc = html.escape(read_text(BTC_FILE), quote=True)
-    qbit_up = qbit_running()
-    ckpool_up = ckpool_running()
+    qbit_up, qbit_synced = chain_status(qbit_rpc)
+    bitcoin_up, bitcoin_synced = chain_status(bitcoin_rpc)
+    ckpool_up = ckpool_connected()
+
     notice = ""
     if message:
         notice = f'<div class="notice success">{html.escape(message)}</div>'
     elif error:
         notice = f'<div class="notice error">{html.escape(error)}</div>'
 
+    updated = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    mode = connection_mode(headers)
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>QBitleapBTC</title>
+<meta http-equiv="refresh" content="300">
+<title>QBitLeapBTC</title>
 <style>
 :root {{
   color-scheme: dark;
@@ -146,26 +202,35 @@ def render(message="", error=""):
 }}
 * {{ box-sizing:border-box; }}
 body {{ margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,sans-serif; }}
-main {{ width:min(720px,calc(100% - 32px)); margin:40px auto; }}
-h1 {{ font-size:28px; margin:0 0 28px; }}
+main {{ width:min(760px,calc(100% - 32px)); margin:40px auto; }}
+.header {{ display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:24px; }}
+h1 {{ font-size:28px; margin:0; }}
 .card {{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:22px; margin-bottom:18px; }}
+h2 {{ margin:0 0 12px; font-size:17px; }}
 label {{ display:block; font-weight:600; margin:0 0 8px; }}
 input {{ width:100%; border:1px solid var(--line); border-radius:9px; padding:12px; margin-bottom:18px; background:#0e141e; color:var(--text); font:inherit; }}
-button {{ border:0; border-radius:9px; padding:11px 20px; background:var(--accent); color:#08101f; font:inherit; font-weight:700; cursor:pointer; }}
-.row {{ display:flex; justify-content:space-between; align-items:center; gap:20px; padding:11px 0; }}
-.row + .row {{ border-top:1px solid var(--line); }}
-.status {{ display:inline-flex; align-items:center; gap:8px; font-weight:600; }}
-.dot {{ width:10px; height:10px; border-radius:50%; background:currentColor; }}
+button, .refresh {{ border:0; border-radius:9px; padding:10px 16px; background:var(--accent); color:#08101f; font:inherit; font-weight:700; cursor:pointer; text-decoration:none; }}
+.service-row, .metric-row {{ display:flex; justify-content:space-between; align-items:center; gap:18px; padding:12px 0; }}
+.service-row + .service-row, .metric-row + .metric-row {{ border-top:1px solid var(--line); }}
+.service-name {{ display:flex; align-items:center; gap:10px; font-weight:650; }}
+.service-dot {{ width:12px; height:12px; border-radius:3px; background:currentColor; flex:0 0 auto; }}
+.service-states {{ display:flex; justify-content:flex-end; gap:14px; flex-wrap:wrap; text-align:right; }}
+.state {{ font-weight:600; white-space:nowrap; }}
 .up {{ color:var(--good); }} .down {{ color:var(--bad); }}
-.metric {{ font-size:28px; font-weight:750; }}
+.metric-value {{ font-weight:700; }}
 .muted {{ color:var(--muted); font-size:13px; margin-top:12px; }}
 .notice {{ border-radius:9px; padding:11px 13px; margin-bottom:18px; }}
 .success {{ background:#123522; color:#8ce7b2; }} .error {{ background:#3a181c; color:#ff9ca5; }}
+.footer {{ color:var(--muted); font-size:12px; text-align:center; }}
+@media (max-width:620px) {{
+  .service-row, .metric-row {{ align-items:flex-start; }}
+  .service-states {{ flex-direction:column; gap:4px; }}
+}}
 </style>
 </head>
 <body>
 <main>
-<h1>QBitLeapBTC</h1>
+<div class="header"><h1>QBitLeapBTC</h1><a class="refresh" href="/">Refresh</a></div>
 {notice}
 <section class="card">
 <form method="post" action="/save">
@@ -175,16 +240,25 @@ button {{ border:0; border-radius:9px; padding:11px 20px; background:var(--accen
 <input id="btc" name="btc_payout" value="{btc}" autocomplete="off" required>
 <button type="submit">Save</button>
 </form>
-<p class="muted">The QBT address is read by CKPool when CKPool starts. The BTC address is stored in the same persistent mining configuration.</p>
+<p class="muted">Both payout addresses are stored in the app's persistent configuration.</p>
 </section>
 <section class="card">
-<div class="row"><span>Qbit Core</span>{status_label(qbit_up)}</div>
-<div class="row"><span>CKPool</span>{status_label(ckpool_up)}</div>
+<h2>Mining Services</h2>
+{service_row("Qbit Core", qbit_up, "Running", "Not Running", state_badge(qbit_synced, "Synced", "Syncing"))}
+{service_row("CKPool", ckpool_up, "Connected", "Not Connected", state_badge(ckpool_up and bool(read_text(QBT_FILE)), "Mining Ready", "Not Ready"))}
+{service_row("Bitcoin Core", bitcoin_up, "Running", "Not Running", state_badge(bitcoin_synced, "Synced", "Syncing"))}
+{service_row("BTC Solo Mine", False, "Connected", "Not Connected", state_badge(False, "Mining", "Not Mining"))}
 </section>
 <section class="card">
-<div class="row"><span>Qbit Blocks Found</span><span class="metric">{qbit_blocks_found()}</span></div>
-<div class="row"><span>Bitcoin Blocks Found</span><span class="metric">0</span></div>
+<h2>Mining Telemetry</h2>
+<div class="metric-row"><span>Connected</span><span class="metric-value">✅ {mode}</span></div>
+<div class="metric-row"><span>Current Hashrate</span><span class="metric-value">—</span></div>
+<div class="metric-row"><span>Best Share</span><span class="metric-value">—</span></div>
+<div class="metric-row"><span>Qbit Blocks Found</span><span class="metric-value">{qbit_blocks_found()}</span></div>
+<div class="metric-row"><span>Bitcoin Blocks Found</span><span class="metric-value">0</span></div>
+<p class="muted">Hashrate and best-share values remain blank until CKPool telemetry is wired in.</p>
 </section>
+<p class="footer">Last updated: {html.escape(updated)} · automatic refresh every 5 minutes</p>
 </main>
 </body>
 </html>""".encode("utf-8")
@@ -195,9 +269,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/":
             self.send_error(404)
             return
-        body = render()
+        body = render(self.headers)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -217,22 +292,28 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Enter a valid QBT payout address.")
             if not ADDRESS_RE.fullmatch(btc):
                 raise ValueError("Enter a valid BTC payout address.")
-            # Validate the QBT address against the running Qbit node.
-            result = qbit_rpc("validateaddress", [qbt])
-            if not isinstance(result, dict) or not result.get("isvalid"):
+
+            qbit_result = qbit_rpc("validateaddress", [qbt])
+            if not isinstance(qbit_result, dict) or not qbit_result.get("isvalid"):
                 raise ValueError("The QBT payout address is not valid for this Qbit network.")
+
+            bitcoin_result = bitcoin_rpc("validateaddress", [btc])
+            if not isinstance(bitcoin_result, dict) or not bitcoin_result.get("isvalid"):
+                raise ValueError("The BTC payout address is not valid for this Bitcoin network.")
+
             atomic_write(QBT_FILE, qbt)
             atomic_write(BTC_FILE, btc)
-            body = render(message="Mining payout addresses saved.")
+            body = render(self.headers, message="Mining payout addresses saved.")
             code = 200
         except ValueError as exc:
-            body = render(error=str(exc))
+            body = render(self.headers, error=str(exc))
             code = 400
         except Exception:
-            body = render(error="The payout addresses could not be saved.")
+            body = render(self.headers, error="The payout addresses could not be saved.")
             code = 500
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

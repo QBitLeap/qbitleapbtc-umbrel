@@ -8,7 +8,7 @@ services:
       PROXY_AUTH_ADD: "false"
 
   dashboard:
-    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.2.6
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.2.7
     restart: unless-stopped
     environment:
       DASHBOARD_PORT: "8080"
@@ -18,6 +18,10 @@ services:
       QBIT_RPC_PASSWORD: ${APP_PASSWORD}
       CKPOOL_HOST: ckpool
       CKPOOL_PORT: "3333"
+      BITCOIN_RPC_HOST: ${APP_BITCOIN_NODE_IP}
+      BITCOIN_RPC_PORT: ${APP_BITCOIN_RPC_PORT}
+      BITCOIN_RPC_USER: ${APP_BITCOIN_RPC_USER}
+      BITCOIN_RPC_PASSWORD: ${APP_BITCOIN_RPC_PASS}
       CONFIG_DIR: /config
       CKPOOL_LOG_DIR: /var/log/ckpool
     volumes:
