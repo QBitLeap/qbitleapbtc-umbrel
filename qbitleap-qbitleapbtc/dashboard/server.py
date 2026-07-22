@@ -107,15 +107,12 @@ def bitcoin_rpc(method, params=None):
 def chain_status(rpc):
     try:
         info = rpc("getblockchaininfo")
-        synced = bool(
-            isinstance(info, dict)
-            and not info.get("initialblockdownload", True)
-            and float(info.get("verificationprogress", 0)) >= 0.9999
-            and int(info.get("blocks", -1)) >= int(info.get("headers", 0))
-        )
-        return True, synced
+        if not isinstance(info, dict):
+            raise RuntimeError("Invalid blockchain status response")
+        block_height = int(info.get("blocks", 0))
+        return True, block_height
     except Exception:
-        return False, False
+        return False, None
 
 
 def ckpool_connected():
@@ -166,16 +163,11 @@ def service_row(name, active, active_text, inactive_text, secondary=None):
     )
 
 
-def connection_mode(headers):
-    host = headers.get("X-Forwarded-Host") or headers.get("Host", "")
-    return "Remotely" if ".onion" in host.lower() else "Locally"
-
-
 def render(headers, message="", error=""):
     qbt = html.escape(read_text(QBT_FILE), quote=True)
     btc = html.escape(read_text(BTC_FILE), quote=True)
-    qbit_up, qbit_synced = chain_status(qbit_rpc)
-    bitcoin_up, bitcoin_synced = chain_status(bitcoin_rpc)
+    qbit_up, qbit_height = chain_status(qbit_rpc)
+    bitcoin_up, bitcoin_height = chain_status(bitcoin_rpc)
     ckpool_up = ckpool_connected()
 
     notice = ""
@@ -185,8 +177,6 @@ def render(headers, message="", error=""):
         notice = f'<div class="notice error">{html.escape(error)}</div>'
 
     updated = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    mode = connection_mode(headers)
-
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -206,7 +196,13 @@ main {{ width:min(760px,calc(100% - 32px)); margin:40px auto; }}
 .header {{ display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:24px; }}
 h1 {{ font-size:28px; margin:0; }}
 .card {{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:22px; margin-bottom:18px; }}
-h2 {{ margin:0 0 12px; font-size:17px; }}
+h2 {{ margin:0; font-size:17px; }}
+details.card {{ padding:0; }}
+summary {{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:22px; cursor:pointer; list-style:none; user-select:none; }}
+summary::-webkit-details-marker {{ display:none; }}
+summary::after {{ content:"▸"; color:var(--muted); font-size:18px; transition:transform .15s ease; }}
+details[open] > summary::after {{ transform:rotate(90deg); }}
+.card-body {{ padding:0 22px 22px; }}
 label {{ display:block; font-weight:600; margin:0 0 8px; }}
 input {{ width:100%; border:1px solid var(--line); border-radius:9px; padding:12px; margin-bottom:18px; background:#0e141e; color:var(--text); font:inherit; }}
 button, .refresh {{ border:0; border-radius:9px; padding:10px 16px; background:var(--accent); color:#08101f; font:inherit; font-weight:700; cursor:pointer; text-decoration:none; }}
@@ -232,7 +228,29 @@ button, .refresh {{ border:0; border-radius:9px; padding:10px 16px; background:v
 <main>
 <div class="header"><h1>QBitLeapBTC</h1><a class="refresh" href="/">Refresh</a></div>
 {notice}
-<section class="card">
+<details class="card" open>
+<summary><h2>Mining Services</h2></summary>
+<div class="card-body">
+{service_row(f"Qbit Core - Block {qbit_height:,}" if qbit_height is not None else "Qbit Core", qbit_up, "Running", "Not Running")}
+{service_row("CKPool", ckpool_up, "Connected", "Not Connected", state_badge(ckpool_up and bool(read_text(QBT_FILE)), "Mining Ready", "Not Ready"))}
+{service_row(f"Bitcoin Core - Block {bitcoin_height:,}" if bitcoin_height is not None else "Bitcoin Core", bitcoin_up, "Running", "Not Running")}
+{service_row("BTC Solo Mine", False, "Connected", "Not Connected", state_badge(False, "Mining", "Not Mining"))}
+</div>
+</details>
+<details class="card" open>
+<summary><h2>Mining Telemetry</h2></summary>
+<div class="card-body">
+<div class="metric-row"><span>Telemetry Status</span><span class="state down">❌ Not Connected</span></div>
+<div class="metric-row"><span>Current Hashrate</span><span class="metric-value">—</span></div>
+<div class="metric-row"><span>Best Share</span><span class="metric-value">—</span></div>
+<div class="metric-row"><span>Qbit Blocks Found</span><span class="metric-value">{qbit_blocks_found()}</span></div>
+<div class="metric-row"><span>Bitcoin Blocks Found</span><span class="metric-value">0</span></div>
+<p class="muted">Telemetry values remain unavailable until CKPool and BTC solo-mining telemetry are wired in.</p>
+</div>
+</details>
+<details class="card">
+<summary><h2>Payout Addresses</h2></summary>
+<div class="card-body">
 <form method="post" action="/save">
 <label for="qbt">QBT Payout Address</label>
 <input id="qbt" name="qbt_payout" value="{qbt}" autocomplete="off" required>
@@ -241,23 +259,8 @@ button, .refresh {{ border:0; border-radius:9px; padding:10px 16px; background:v
 <button type="submit">Save</button>
 </form>
 <p class="muted">Both payout addresses are stored in the app's persistent configuration.</p>
-</section>
-<section class="card">
-<h2>Mining Services</h2>
-{service_row("Qbit Core", qbit_up, "Running", "Not Running", state_badge(qbit_synced, "Synced", "Syncing"))}
-{service_row("CKPool", ckpool_up, "Connected", "Not Connected", state_badge(ckpool_up and bool(read_text(QBT_FILE)), "Mining Ready", "Not Ready"))}
-{service_row("Bitcoin Core", bitcoin_up, "Running", "Not Running", state_badge(bitcoin_synced, "Synced", "Syncing"))}
-{service_row("BTC Solo Mine", False, "Connected", "Not Connected", state_badge(False, "Mining", "Not Mining"))}
-</section>
-<section class="card">
-<h2>Mining Telemetry</h2>
-<div class="metric-row"><span>Connected</span><span class="metric-value">✅ {mode}</span></div>
-<div class="metric-row"><span>Current Hashrate</span><span class="metric-value">—</span></div>
-<div class="metric-row"><span>Best Share</span><span class="metric-value">—</span></div>
-<div class="metric-row"><span>Qbit Blocks Found</span><span class="metric-value">{qbit_blocks_found()}</span></div>
-<div class="metric-row"><span>Bitcoin Blocks Found</span><span class="metric-value">0</span></div>
-<p class="muted">Hashrate and best-share values remain blank until CKPool telemetry is wired in.</p>
-</section>
+</div>
+</details>
 <p class="footer">Last updated: {html.escape(updated)} · automatic refresh every 5 minutes</p>
 </main>
 </body>
