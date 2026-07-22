@@ -16,14 +16,13 @@ PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/config"))
 QBT_FILE = CONFIG_DIR / "qbt-payout-address.txt"
 BTC_FILE = CONFIG_DIR / "btc-payout-address.txt"
-CKPOOL_LOG_DIR = Path(os.environ.get("CKPOOL_LOG_DIR", "/var/log/ckpool"))
 
 QBIT_RPC_HOST = os.environ.get("QBIT_RPC_HOST", "qbitd")
 QBIT_RPC_PORT = int(os.environ.get("QBIT_RPC_PORT", "8352"))
 QBIT_RPC_USER = os.environ.get("QBIT_RPC_USER", "qbitrpc")
 QBIT_RPC_PASSWORD = os.environ.get("QBIT_RPC_PASSWORD", "")
-CKPOOL_HOST = os.environ.get("CKPOOL_HOST", "ckpool")
-CKPOOL_PORT = int(os.environ.get("CKPOOL_PORT", "3333"))
+AUXPOW_HOST = os.environ.get("AUXPOW_HOST", "auxpow")
+AUXPOW_PORT = int(os.environ.get("AUXPOW_PORT", "3335"))
 
 BITCOIN_RPC_HOST = os.environ.get("BITCOIN_RPC_HOST", "")
 BITCOIN_RPC_PORT = int(os.environ.get("BITCOIN_RPC_PORT", "8332"))
@@ -115,34 +114,12 @@ def chain_status(rpc):
         return False, None
 
 
-def ckpool_connected():
+def auxpow_connected():
     try:
-        with socket.create_connection((CKPOOL_HOST, CKPOOL_PORT), timeout=2):
+        with socket.create_connection((AUXPOW_HOST, AUXPOW_PORT), timeout=2):
             return True
     except OSError:
         return False
-
-
-def qbit_blocks_found():
-    patterns = (
-        re.compile(r"\bsolved\b.*\bblock\b", re.I),
-        re.compile(r"\bblock\b.*\bsolved\b", re.I),
-        re.compile(r"\bconfirmed\b.*\bblock\b", re.I),
-    )
-    seen = set()
-    try:
-        files = [path for path in CKPOOL_LOG_DIR.rglob("*") if path.is_file()]
-    except OSError:
-        return 0
-    for path in files:
-        try:
-            with path.open("r", encoding="utf-8", errors="ignore") as handle:
-                for line in handle:
-                    if any(pattern.search(line) for pattern in patterns):
-                        seen.add(line.strip())
-        except OSError:
-            continue
-    return len(seen)
 
 
 def state_badge(ok, yes_text, no_text):
@@ -170,7 +147,7 @@ def render(headers, message="", error=""):
     btc = html.escape(read_text(BTC_FILE), quote=True)
     qbit_up, qbit_height = chain_status(qbit_rpc)
     bitcoin_up, bitcoin_height = chain_status(bitcoin_rpc)
-    ckpool_up = ckpool_connected()
+    auxpow_up = auxpow_connected()
 
     notice = ""
     if message:
@@ -185,7 +162,7 @@ def render(headers, message="", error=""):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="300">
-<title>QBitLeapBTC</title>
+<title>QBitLeap BTC</title>
 <style>
 :root {{
   color-scheme: dark;
@@ -229,15 +206,14 @@ button, .refresh {{ border:0; border-radius:9px; padding:10px 16px; background:v
 </head>
 <body>
 <main>
-<div class="header"><h1>QBitLeapBTC</h1><a class="refresh" href="/">Refresh</a></div>
+<div class="header"><h1>QBitLeap BTC</h1><a class="refresh" href="/">Refresh</a></div>
 {notice}
 <details class="card" open>
 <summary><h2>Mining Services</h2></summary>
 <div class="card-body">
 {service_row("Qbit Core", qbit_up, f"Block {qbit_height:,}" if qbit_height is not None else "Not Running")}
-{service_row("CKPool", ckpool_up, "Connected" if ckpool_up else "Not Connected")}
 {service_row("Bitcoin Core", bitcoin_up, f"Block {bitcoin_height:,}" if bitcoin_height is not None else "Not Running")}
-{service_row("BTC Solo Mine", False, "Not Connected")}
+{service_row("AuxPoW Merge Mine", auxpow_up, "Connected" if auxpow_up else "Not Connected")}
 </div>
 </details>
 <details class="card" open>
@@ -246,9 +222,9 @@ button, .refresh {{ border:0; border-radius:9px; padding:10px 16px; background:v
 <div class="metric-row"><span>Telemetry Status</span><span class="state down">❌ Not Connected</span></div>
 <div class="metric-row"><span>Current Hashrate</span><span class="metric-value">—</span></div>
 <div class="metric-row"><span>Best Share</span><span class="metric-value">—</span></div>
-<div class="metric-row"><span>Qbit Blocks Found</span><span class="metric-value">{qbit_blocks_found()}</span></div>
-<div class="metric-row"><span>Bitcoin Blocks Found</span><span class="metric-value">0</span></div>
-<p class="muted">Telemetry values remain unavailable until CKPool and BTC solo-mining telemetry are wired in.</p>
+<div class="metric-row"><span>Qbit Blocks Found</span><span class="metric-value">—</span></div>
+<div class="metric-row"><span>Bitcoin Blocks Found</span><span class="metric-value">—</span></div>
+<p class="muted">Telemetry values remain unavailable until AuxPoW mining telemetry is implemented.</p>
 </div>
 </details>
 <details class="card">

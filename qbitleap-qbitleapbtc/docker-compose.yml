@@ -8,7 +8,7 @@ services:
       PROXY_AUTH_ADD: "false"
 
   dashboard:
-    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.2.9
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.3.0
     restart: unless-stopped
     environment:
       DASHBOARD_PORT: "8080"
@@ -16,17 +16,15 @@ services:
       QBIT_RPC_PORT: "8352"
       QBIT_RPC_USER: qbitrpc
       QBIT_RPC_PASSWORD: ${APP_PASSWORD}
-      CKPOOL_HOST: ckpool
-      CKPOOL_PORT: "3333"
       BITCOIN_RPC_HOST: ${APP_BITCOIN_NODE_IP}
       BITCOIN_RPC_PORT: ${APP_BITCOIN_RPC_PORT}
       BITCOIN_RPC_USER: ${APP_BITCOIN_RPC_USER}
       BITCOIN_RPC_PASSWORD: ${APP_BITCOIN_RPC_PASS}
+      AUXPOW_HOST: auxpow
+      AUXPOW_PORT: "3335"
       CONFIG_DIR: /config
-      CKPOOL_LOG_DIR: /var/log/ckpool
     volumes:
       - ${APP_DATA_DIR}/config:/config
-      - ${APP_DATA_DIR}/ckpool/logs:/var/log/ckpool:ro
     depends_on:
       qbitd:
         condition: service_healthy
@@ -117,8 +115,8 @@ services:
       retries: 30
       start_period: 30s
 
-  ckpool:
-    image: ghcr.io/qbitleap/qbitleapbtc-ckpool:0.2.6
+  auxpow:
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.3.0
     restart: unless-stopped
 
     depends_on:
@@ -126,34 +124,56 @@ services:
         condition: service_healthy
 
     environment:
-      QBIT_PRODUCTION: "1"
-      QBIT_TOOLS_PRODUCTION: "1"
-      QBIT_MAINNET_LAUNCH_READINESS_CHECKS_ENABLED: "1"
+      AUXPOW_MODE: stratum
+      AUXPOW_TEMPLATE_MAX_AGE_SECONDS: "120"
+      AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS: "7200"
+      AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS: "120"
+      AUXPOW_STRATUM_BIND: 0.0.0.0
+      AUXPOW_STRATUM_PORT: "3335"
+      AUXPOW_STRATUM_SHARE_DIFF: "1"
+      AUXPOW_STRATUM_VARDIFF_ENABLED: "1"
+      AUXPOW_STRATUM_VARDIFF_TARGET_SHARE_SECONDS: "5"
+      AUXPOW_STRATUM_VARDIFF_MIN_DIFF: "1024"
+      AUXPOW_STRATUM_VARDIFF_MAX_DIFF: "4294967296"
+      AUXPOW_STRATUM_VARDIFF_RETARGET_SECONDS: "120"
+      AUXPOW_STRATUM_VARDIFF_MAX_STEP_FACTOR: "4"
+      AUXPOW_STRATUM_VARDIFF_MAX_STEP_DOWN_FACTOR: "2"
+      AUXPOW_STRATUM_VARDIFF_EWMA_ALPHA: "0.4"
+      AUXPOW_STRATUM_VARDIFF_RETARGET_TOLERANCE: "0.25"
+      AUXPOW_STRATUM_VARDIFF_STARTUP_DIFF: "8192"
+      AUXPOW_STRATUM_VARDIFF_APPLY_MODE: next_job
+      AUXPOW_STRATUM_MIN_ADVERTISED_DIFF: "0"
+      AUXPOW_STRATUM_POLL_SECONDS: "5"
+      AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS: "2700"
+      AUXPOW_STRATUM_VERSION_MASK: 1fffe000
+      AUXPOW_STRATUM_HEADER_VARIANT: canonical
+      AUXPOW_STRATUM_ACCEPT_DIAGNOSTIC_VARIANT: "0"
+      AUXPOW_STRATUM_STATS_INTERVAL_SECONDS: "60"
       QBIT_CHAIN: mainnet
       QBIT_RPC_HOST: qbitd
       QBIT_RPC_PORT: "8352"
       QBIT_RPC_USER: qbitrpc
       QBIT_RPC_PASSWORD: ${APP_PASSWORD}
       QBIT_MINER_ADDRESS_FILE: /config/qbt-payout-address.txt
-      QBIT_MINER_ADDRESS_POLL_SECONDS: "2"
-      CKPOOL_LOG_DIR: /var/log/ckpool
-      CKPOOL_STATE_DIR: /var/lib/ckpool
-      CKPOOL_SOCK_DIR: /tmp/qbitleap
-      CKPOOL_STRATUM_PORT: "3333"
-      CKPOOL_NON_TEST_READINESS_GATE: "1"
+      BITCOIN_CHAIN: mainnet
+      BITCOIN_RPC_HOST: ${APP_BITCOIN_NODE_IP}
+      BITCOIN_RPC_PORT: ${APP_BITCOIN_RPC_PORT}
+      BITCOIN_RPC_USER: ${APP_BITCOIN_RPC_USER}
+      BITCOIN_RPC_PASSWORD: ${APP_BITCOIN_RPC_PASS}
+      BITCOIN_MINER_ADDRESS_FILE: /config/btc-payout-address.txt
+      AUXPOW_ADDRESS_POLL_SECONDS: "2"
 
     ports:
-      - "3333:3333"
+      - "3335:3335"
 
     volumes:
       - ${APP_DATA_DIR}/config:/config:ro
-      - ${APP_DATA_DIR}/ckpool/logs:/var/log/ckpool
-      - ${APP_DATA_DIR}/ckpool/state:/var/lib/ckpool
 
     healthcheck:
       test:
         - CMD-SHELL
-        - bash -lc 'exec 3<>/dev/tcp/127.0.0.1/3333'
+        - >-
+          python3 -c "import socket; s=socket.create_connection(('127.0.0.1',3335),2); s.close()"
       interval: 10s
       timeout: 5s
       retries: 30

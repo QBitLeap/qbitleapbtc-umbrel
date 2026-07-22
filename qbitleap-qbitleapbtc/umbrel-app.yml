@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.2.9"
+version: "0.3.0"
 port: 8080
 
 description: >-
@@ -25,7 +25,7 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 gallery: []
 
 releaseNotes: >-
-  Add collapsible dashboard sections, live Qbit and Bitcoin block heights, move payout settings to the bottom, and clarify that mining telemetry is not connected yet.
+  Replace CKPool and the separate BTC solo placeholder with the official AuxPoW Stratum merge-mining service connected to Qbit Core and Umbrel Bitcoin Core.
 
 dependencies:
   - bitcoin
