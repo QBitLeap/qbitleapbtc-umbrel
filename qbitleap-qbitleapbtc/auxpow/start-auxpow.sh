@@ -26,4 +26,4 @@ while :; do
   sleep "$POLL_SECONDS"
 done
 
-exec python3 -m lab.auxpow.auxpow_coordinator
+exec python3 /app/telemetry_runner.py

@@ -33,6 +33,7 @@ jobs:
           test -f "${UPSTREAM_DIR}/lab/auxpow/vardiff.py"
           test -f "${AUXPOW_DIR}/Dockerfile"
           test -f "${AUXPOW_DIR}/start-auxpow.sh"
+          test -f "${AUXPOW_DIR}/telemetry_runner.py"
 
       - name: Prepare pinned Qbit source
         working-directory: ${{ env.UPSTREAM_DIR }}
@@ -61,7 +62,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.IMAGE_NAME }}:0.3.0
+            ${{ env.IMAGE_NAME }}:0.4.0
             ${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max

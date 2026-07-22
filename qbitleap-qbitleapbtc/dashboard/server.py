@@ -16,6 +16,7 @@ PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/config"))
 QBT_FILE = CONFIG_DIR / "qbt-payout-address.txt"
 BTC_FILE = CONFIG_DIR / "btc-payout-address.txt"
+TELEMETRY_FILE = Path(os.environ.get("TELEMETRY_FILE", "/telemetry/telemetry.json"))
 
 QBIT_RPC_HOST = os.environ.get("QBIT_RPC_HOST", "qbitd")
 QBIT_RPC_PORT = int(os.environ.get("QBIT_RPC_PORT", "8352"))
@@ -122,6 +123,44 @@ def auxpow_connected():
         return False
 
 
+
+def read_telemetry():
+    try:
+        data = json.loads(TELEMETRY_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("invalid telemetry")
+        if int(data.get("updated_at", 0)) < int(datetime.now().timestamp()) - 15:
+            return None
+        return data
+    except (FileNotFoundError, ValueError, json.JSONDecodeError, OSError):
+        return None
+
+
+def format_hashrate(value):
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    units = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s"]
+    unit = units[0]
+    for unit in units:
+        if abs(rate) < 1000 or unit == units[-1]:
+            break
+        rate /= 1000
+    return f"{rate:.2f} {unit}"
+
+
+def format_number(value, decimals=2):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if number == 0:
+        return "0"
+    if number >= 1000:
+        return f"{number:,.0f}"
+    return f"{number:.{decimals}f}"
+
 def state_badge(ok, yes_text, no_text):
     cls = "up" if ok else "down"
     text = yes_text if ok else no_text
@@ -148,6 +187,7 @@ def render(headers, message="", error=""):
     qbit_up, qbit_height = chain_status(qbit_rpc)
     bitcoin_up, bitcoin_height = chain_status(bitcoin_rpc)
     auxpow_up = auxpow_connected()
+    telemetry = read_telemetry()
 
     notice = ""
     if message:
@@ -219,12 +259,15 @@ button, .refresh {{ border:0; border-radius:9px; padding:10px 16px; background:v
 <details class="card" open>
 <summary><h2>Mining Telemetry</h2></summary>
 <div class="card-body">
-<div class="metric-row"><span>Telemetry Status</span><span class="state down">❌ Not Connected</span></div>
-<div class="metric-row"><span>Current Hashrate</span><span class="metric-value">—</span></div>
-<div class="metric-row"><span>Best Share</span><span class="metric-value">—</span></div>
-<div class="metric-row"><span>Qbit Blocks Found</span><span class="metric-value">—</span></div>
-<div class="metric-row"><span>Bitcoin Blocks Found</span><span class="metric-value">—</span></div>
-<p class="muted">Telemetry values remain unavailable until AuxPoW mining telemetry is implemented.</p>
+<div class="metric-row"><span>Telemetry Status</span>{state_badge(telemetry is not None, "Live", "Not Connected")}</div>
+<div class="metric-row"><span>Connected Workers</span><span class="metric-value">{int(telemetry.get("connected_workers", 0)) if telemetry else "—"}</span></div>
+<div class="metric-row"><span>Current Hashrate</span><span class="metric-value">{format_hashrate(telemetry.get("current_hashrate_hs")) if telemetry else "—"}</span></div>
+<div class="metric-row"><span>Current Difficulty</span><span class="metric-value">{format_number(telemetry.get("current_difficulty")) if telemetry else "—"}</span></div>
+<div class="metric-row"><span>Accepted Shares</span><span class="metric-value">{int(telemetry.get("accepted_shares", 0)) if telemetry else "—"}</span></div>
+<div class="metric-row"><span>Rejected Shares</span><span class="metric-value">{int(telemetry.get("rejected_shares", 0)) if telemetry else "—"}</span></div>
+<div class="metric-row"><span>Best Share</span><span class="metric-value">{format_number(telemetry.get("best_share_difficulty")) if telemetry else "—"}</span></div>
+<div class="metric-row"><span>Qbit Blocks Found</span><span class="metric-value">{int(telemetry.get("qbit_blocks_found", 0)) if telemetry else "—"}</span></div>
+<div class="metric-row"><span>Bitcoin Blocks Found</span><span class="metric-value">{int(telemetry.get("bitcoin_blocks_found", 0)) if telemetry else "—"}</span></div>
 </div>
 </details>
 <details class="card">

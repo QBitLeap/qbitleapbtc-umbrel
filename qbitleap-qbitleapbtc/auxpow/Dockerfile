@@ -9,9 +9,12 @@ COPY --from=qbit-src test/functional /opt/qbit-functional
 
 # Copy the unmodified official qbit-mining-bootstrap AuxPoW components.
 COPY qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap/lab/auxpow/*.py /app/lab/auxpow/
-COPY qbitleap-qbitleapbtc/auxpow/start-auxpow.sh /usr/local/bin/start-auxpow
 
-RUN chmod 0755 /usr/local/bin/start-auxpow
+# QBitLeap BTC's thin Umbrel startup and telemetry wrapper.
+COPY qbitleap-qbitleapbtc/auxpow/start-auxpow.sh /usr/local/bin/start-auxpow
+COPY qbitleap-qbitleapbtc/auxpow/telemetry_runner.py /app/telemetry_runner.py
+
+RUN chmod 0755 /usr/local/bin/start-auxpow /app/telemetry_runner.py
 
 ENV PYTHONPATH=/app:/opt/qbit-functional
 
