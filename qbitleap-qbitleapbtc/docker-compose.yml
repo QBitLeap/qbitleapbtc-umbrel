@@ -118,7 +118,7 @@ services:
       start_period: 30s
 
   auxpow:
-    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.4.0
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.4.1
     restart: unless-stopped
 
     depends_on:
@@ -158,6 +158,7 @@ services:
       QBIT_RPC_PASSWORD: ${APP_PASSWORD}
       QBIT_MINER_ADDRESS_FILE: /config/qbt-payout-address.txt
       BITCOIN_CHAIN: mainnet
+      BITCOIN_EXPECTED_GENESIS_HASH: 000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
       BITCOIN_RPC_HOST: ${APP_BITCOIN_NODE_IP}
       BITCOIN_RPC_PORT: ${APP_BITCOIN_RPC_PORT}
       BITCOIN_RPC_USER: ${APP_BITCOIN_RPC_USER}
