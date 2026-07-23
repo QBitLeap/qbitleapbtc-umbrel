@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.4.2"
+version: "0.4.3"
 port: 8080
 
 description: >-
@@ -25,7 +25,7 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 gallery: []
 
 releaseNotes: >-
-  Pin the canonical Bitcoin mainnet genesis hash required by the official AuxPoW coordinator.
+  Simplify the AuxPoW service display so its green or red status indicator conveys health without redundant connection text.
 
 dependencies:
   - bitcoin

@@ -8,7 +8,7 @@ services:
       PROXY_AUTH_ADD: "false"
 
   dashboard:
-    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.4.0
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.4.3
     restart: unless-stopped
     environment:
       DASHBOARD_PORT: "8080"

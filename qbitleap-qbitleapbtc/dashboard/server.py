@@ -168,14 +168,15 @@ def state_badge(ok, yes_text, no_text):
     return f'<span class="state {cls}">{icon} {html.escape(text)}</span>'
 
 
-def service_row(name, active, status):
+def service_row(name, active, status=""):
     dot_class = "up" if active else "down"
+    status_html = f'<span class="service-status">{html.escape(status)}</span>' if status else ""
     return (
         '<div class="service-row">'
         '<span class="service-line">'
         f'<span class="service-dot {dot_class}"></span>'
         f'<span>{html.escape(name)}</span>'
-        f'<span class="service-status">{html.escape(status)}</span>'
+        f'{status_html}'
         '</span>'
         '</div>'
     )
@@ -253,7 +254,7 @@ button, .refresh {{ border:0; border-radius:9px; padding:10px 16px; background:v
 <div class="card-body">
 {service_row("Qbit Core", qbit_up, f"Block {qbit_height:,}" if qbit_height is not None else "Not Running")}
 {service_row("Bitcoin Core", bitcoin_up, f"Block {bitcoin_height:,}" if bitcoin_height is not None else "Not Running")}
-{service_row("AuxPoW Merge Mine", auxpow_up, "Connected" if auxpow_up else "Not Connected")}
+{service_row("AuxPoW Merge Mine", auxpow_up)}
 </div>
 </details>
 <details class="card" open>
