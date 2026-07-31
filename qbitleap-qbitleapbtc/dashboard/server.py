@@ -16,6 +16,7 @@ PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/config"))
 QBT_FILE = CONFIG_DIR / "qbt-payout-address.txt"
 BTC_FILE = CONFIG_DIR / "btc-payout-address.txt"
+EXPECTED_FILE = CONFIG_DIR / "miner-expected-hashrates.json"
 TELEMETRY_FILE = Path(os.environ.get("TELEMETRY_FILE", "/telemetry/telemetry.json"))
 
 QBIT_RPC_HOST = os.environ.get("QBIT_RPC_HOST", "qbitd")
@@ -161,6 +162,71 @@ def format_number(value, decimals=2):
         return f"{number:,.0f}"
     return f"{number:.{decimals}f}"
 
+def parse_expected_text(value):
+    result = {}
+    for raw in value.splitlines():
+        raw = raw.strip()
+        if not raw or raw.startswith("#"):
+            continue
+        if "=" not in raw:
+            raise ValueError("Expected hashrates must use worker=TH/s, one per line.")
+        worker, rate = (part.strip() for part in raw.split("=", 1))
+        if not worker or float(rate) <= 0:
+            raise ValueError("Each expected miner hashrate must be greater than zero.")
+        result[worker] = float(rate) * 1_000_000_000_000
+    return result
+
+
+def expected_text():
+    try:
+        data = json.loads(EXPECTED_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return ""
+        return "\n".join(f"{name}={float(rate) / 1_000_000_000_000:g}" for name, rate in sorted(data.items()))
+    except Exception:
+        return ""
+
+
+def age_text(timestamp):
+    try:
+        seconds = max(0, int(datetime.now().timestamp()) - int(timestamp))
+    except (TypeError, ValueError):
+        return "—"
+    if seconds < 60:
+        return f"{seconds} sec ago"
+    if seconds < 3600:
+        return f"{seconds // 60} min ago"
+    return f"{seconds // 3600} hr ago"
+
+
+def reject_rate(accepted, rejected):
+    total = accepted + rejected
+    return 0.0 if total <= 0 else rejected * 100.0 / total
+
+
+def health_class(worker):
+    if not worker.get("active"):
+        return "down", "Not Mining"
+    rejected = reject_rate(int(worker.get("accepted", 0)), int(worker.get("rejected", 0)))
+    expected = float(worker.get("expected_hashrate_hs", 0) or 0)
+    actual = float(worker.get("hashrate_hs", 0) or 0)
+    if rejected >= 5 or (expected and actual < expected * 0.7):
+        return "warn", "Needs Attention"
+    return "up", "Mining Normally"
+
+
+def block_history_rows(items, empty_text):
+    if not items:
+        return f'<p class="muted empty">{html.escape(empty_text)}</p>'
+    rows = []
+    for item in items:
+        when = datetime.fromtimestamp(int(item.get("found_at", 0))).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        height = item.get("height")
+        height_text = f"Block {int(height):,}" if height is not None else "Block height unavailable"
+        rows.append('<div class="history-row"><div><strong>' + html.escape(height_text) + '</strong><div class="muted compact">' + html.escape(when) + '</div></div><span>' + html.escape(str(item.get("worker", "unknown"))) + '</span></div>')
+    return "".join(rows)
+
+
 def state_badge(ok, yes_text, no_text):
     cls = "up" if ok else "down"
     text = yes_text if ok else no_text
@@ -185,109 +251,73 @@ def service_row(name, active, status=""):
 def render(headers, message="", error=""):
     qbt = html.escape(read_text(QBT_FILE), quote=True)
     btc = html.escape(read_text(BTC_FILE), quote=True)
+    expected = html.escape(expected_text())
     qbit_up, qbit_height = chain_status(qbit_rpc)
     bitcoin_up, bitcoin_height = chain_status(bitcoin_rpc)
     auxpow_up = auxpow_connected()
     telemetry = read_telemetry()
+    workers = telemetry.get("workers", []) if telemetry else []
+    history = telemetry.get("block_history", {}) if telemetry else {}
+    accepted = int(telemetry.get("accepted_shares", 0)) if telemetry else 0
+    rejected = int(telemetry.get("rejected_shares", 0)) if telemetry else 0
+    rejects = reject_rate(accepted, rejected)
+    last_share = max((int(worker.get("last_share_at", 0)) for worker in workers), default=0)
+    expected_total = sum(float(worker.get("expected_hashrate_hs", 0) or 0) for worker in workers)
+    total_rate = float(telemetry.get("current_hashrate_hs", 0) or 0) if telemetry else 0
+    if not telemetry or not workers or not last_share or int(datetime.now().timestamp()) - last_share > 180:
+        overall_cls, overall_text = "down", "Not Mining"
+    elif rejects >= 5 or (expected_total and total_rate < expected_total * 0.7):
+        overall_cls, overall_text = "warn", "Needs Attention"
+    else:
+        overall_cls, overall_text = "up", "Mining Normally"
 
-    notice = ""
-    if message:
-        notice = f'<div class="notice success">{html.escape(message)}</div>'
-    elif error:
-        notice = f'<div class="notice error">{html.escape(error)}</div>'
-
+    notice = f'<div class="notice success">{html.escape(message)}</div>' if message else (f'<div class="notice error">{html.escape(error)}</div>' if error else "")
     updated = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    worker_rows = []
+    for worker in workers:
+        cls, label = health_class(worker)
+        expected_rate = float(worker.get("expected_hashrate_hs", 0) or 0)
+        details = [format_hashrate(worker.get("hashrate_hs")), f'{reject_rate(int(worker.get("accepted",0)), int(worker.get("rejected",0))):.1f}% rejected', f'last share {age_text(worker.get("last_share_at"))}']
+        if expected_rate:
+            details.insert(1, f'expected {format_hashrate(expected_rate)}')
+        worker_rows.append(f'<div class="worker-row"><div class="worker-title"><span class="service-dot {cls}"></span><strong>{html.escape(str(worker.get("name","unknown")))}</strong><span class="worker-state {cls}">{html.escape(label)}</span></div><div class="worker-detail">{html.escape(" · ".join(details))}</div></div>')
+    if not worker_rows:
+        worker_rows.append('<p class="muted empty">No local miners connected.</p>')
+
     return f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="300">
-<title>QBitLeap BTC</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="300"><title>QBitLeap BTC</title>
 <style>
-:root {{
-  color-scheme: dark;
-  --bg:#0c1017; --panel:#151b25; --line:#283142; --text:#f5f7fa;
-  --muted:#98a2b3; --accent:#7c9cff; --good:#36c275; --bad:#f05d68;
-}}
-* {{ box-sizing:border-box; }}
-body {{ margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,sans-serif; }}
-main {{ width:min(760px,calc(100% - 32px)); margin:40px auto; }}
-.header {{ display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:24px; }}
-h1 {{ font-size:28px; margin:0; }}
-.card {{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:22px; margin-bottom:18px; }}
-h2 {{ margin:0; font-size:17px; }}
-details.card {{ padding:0; }}
-summary {{ position:relative; display:flex; align-items:center; justify-content:center; gap:12px; padding:22px; cursor:pointer; list-style:none; user-select:none; text-align:center; }}
-summary::-webkit-details-marker {{ display:none; }}
-summary::after {{ content:"▸"; position:absolute; right:22px; color:var(--muted); font-size:18px; transition:transform .15s ease; }}
-details[open] > summary::after {{ transform:rotate(90deg); }}
-.card-body {{ padding:0 22px 22px; }}
-label {{ display:block; font-weight:600; margin:0 0 8px; }}
-input {{ width:100%; border:1px solid var(--line); border-radius:9px; padding:12px; margin-bottom:18px; background:#0e141e; color:var(--text); font:inherit; }}
-button, .refresh {{ border:0; border-radius:9px; padding:10px 16px; background:var(--accent); color:#08101f; font:inherit; font-weight:700; cursor:pointer; text-decoration:none; }}
-.service-row {{ display:flex; justify-content:center; align-items:center; padding:12px 0; text-align:center; }}
-.metric-row {{ display:flex; justify-content:space-between; align-items:center; gap:18px; padding:12px 0; }}
-.service-row + .service-row, .metric-row + .metric-row {{ border-top:1px solid var(--line); }}
-.service-line {{ display:inline-flex; align-items:center; justify-content:center; gap:10px; font-weight:650; text-align:center; }}
-.service-dot {{ width:12px; height:12px; border-radius:3px; background:currentColor; flex:0 0 auto; }}
-.service-status {{ font-weight:600; }}
-.state {{ font-weight:600; white-space:nowrap; }}
-.up {{ color:var(--good); }} .down {{ color:var(--bad); }}
-.metric-value {{ font-weight:700; }}
-.muted {{ color:var(--muted); font-size:13px; margin-top:12px; }}
-.notice {{ border-radius:9px; padding:11px 13px; margin-bottom:18px; }}
-.success {{ background:#123522; color:#8ce7b2; }} .error {{ background:#3a181c; color:#ff9ca5; }}
-.footer {{ color:var(--muted); font-size:12px; text-align:center; }}
-@media (max-width:620px) {{
-  .metric-row {{ align-items:flex-start; }}
-  .service-line {{ flex-wrap:wrap; }}
-}}
-</style>
-</head>
-<body>
-<main>
-<div class="header"><h1>QBitLeap BTC</h1><a class="refresh" href="/">Refresh</a></div>
-{notice}
-<details class="card" open>
-<summary><h2>Mining Services</h2></summary>
-<div class="card-body">
-{service_row("Qbit Core", qbit_up, f"Block {qbit_height:,}" if qbit_height is not None else "Not Running")}
-{service_row("Bitcoin Core", bitcoin_up, f"Block {bitcoin_height:,}" if bitcoin_height is not None else "Not Running")}
-{service_row("AuxPoW Merge Mine", auxpow_up)}
-</div>
-</details>
-<details class="card" open>
-<summary><h2>Mining Telemetry</h2></summary>
-<div class="card-body">
-<div class="metric-row"><span>Telemetry Status</span>{state_badge(telemetry is not None, "Live", "Not Connected")}</div>
-<div class="metric-row"><span>Connected Workers</span><span class="metric-value">{int(telemetry.get("connected_workers", 0)) if telemetry else "—"}</span></div>
-<div class="metric-row"><span>Current Hashrate</span><span class="metric-value">{format_hashrate(telemetry.get("current_hashrate_hs")) if telemetry else "—"}</span></div>
-<div class="metric-row"><span>Current Difficulty</span><span class="metric-value">{format_number(telemetry.get("current_difficulty")) if telemetry else "—"}</span></div>
-<div class="metric-row"><span>Accepted Shares</span><span class="metric-value">{int(telemetry.get("accepted_shares", 0)) if telemetry else "—"}</span></div>
-<div class="metric-row"><span>Rejected Shares</span><span class="metric-value">{int(telemetry.get("rejected_shares", 0)) if telemetry else "—"}</span></div>
-<div class="metric-row"><span>Best Share</span><span class="metric-value">{format_number(telemetry.get("best_share_difficulty")) if telemetry else "—"}</span></div>
-<div class="metric-row"><span>Qbit Blocks Found</span><span class="metric-value">{int(telemetry.get("qbit_blocks_found", 0)) if telemetry else "—"}</span></div>
-<div class="metric-row"><span>Bitcoin Blocks Found</span><span class="metric-value">{int(telemetry.get("bitcoin_blocks_found", 0)) if telemetry else "—"}</span></div>
-</div>
-</details>
-<details class="card">
-<summary><h2>Payout Addresses</h2></summary>
-<div class="card-body">
-<form method="post" action="/save">
-<label for="qbt">QBT Payout Address</label>
-<input id="qbt" name="qbt_payout" value="{qbt}" autocomplete="off" required>
-<label for="btc">BTC Payout Address</label>
-<input id="btc" name="btc_payout" value="{btc}" autocomplete="off" required>
-<button type="submit">Save</button>
-</form>
-<p class="muted">Both payout addresses are stored in the app's persistent configuration.</p>
-</div>
-</details>
-<p class="footer">Last updated: {html.escape(updated)} · automatic refresh every 5 minutes</p>
-</main>
-</body>
-</html>""".encode("utf-8")
+:root {{color-scheme:dark;--bg:#0c1017;--panel:#151b25;--line:#283142;--text:#f5f7fa;--muted:#98a2b3;--accent:#7c9cff;--good:#36c275;--warn:#e4ad3d;--bad:#f05d68;}}
+*{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif}} main{{width:min(760px,calc(100% - 32px));margin:40px auto}}
+.header{{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}} h1{{font-size:28px;margin:0}} .card{{background:var(--panel);border:1px solid var(--line);border-radius:14px;margin-bottom:18px}}
+h2{{margin:0;font-size:17px}} summary{{position:relative;display:flex;align-items:center;justify-content:center;padding:22px;cursor:pointer;list-style:none}} summary::-webkit-details-marker{{display:none}} summary::after{{content:"▸";position:absolute;right:22px;color:var(--muted)}} details[open]>summary::after{{transform:rotate(90deg)}} .card-body{{padding:0 22px 22px}}
+.service-row{{display:flex;justify-content:center;padding:12px 0;text-align:center}} .service-row+.service-row,.metric-row+.metric-row,.worker-row+.worker-row,.history-row+.history-row{{border-top:1px solid var(--line)}} .service-line{{display:inline-flex;align-items:center;gap:10px;font-weight:650}} .service-dot{{width:12px;height:12px;border-radius:3px;background:currentColor;flex:0 0 auto}}
+.metric-row,.history-row{{display:flex;justify-content:space-between;align-items:center;gap:18px;padding:12px 0}} .metric-value{{font-weight:700}} .status-text{{font-weight:700}} .up{{color:var(--good)}} .warn{{color:var(--warn)}} .down{{color:var(--bad)}}
+.worker-row{{padding:14px 0}} .worker-title{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}} .worker-state{{margin-left:auto;font-weight:650}} .worker-detail{{color:var(--muted);font-size:13px;margin:7px 0 0 22px}}
+label{{display:block;font-weight:600;margin:0 0 8px}} input,textarea{{width:100%;border:1px solid var(--line);border-radius:9px;padding:12px;margin-bottom:18px;background:#0e141e;color:var(--text);font:inherit}} textarea{{min-height:100px;resize:vertical}} button,.refresh{{border:0;border-radius:9px;padding:10px 16px;background:var(--accent);color:#08101f;font:inherit;font-weight:700;cursor:pointer;text-decoration:none}}
+.muted{{color:var(--muted);font-size:13px;margin-top:12px}} .compact{{margin:3px 0 0}} .empty{{text-align:center;padding:12px 0}} .notice{{border-radius:9px;padding:11px 13px;margin-bottom:18px}} .success{{background:#123522;color:#8ce7b2}} .error{{background:#3a181c;color:#ff9ca5}} .footer{{color:var(--muted);font-size:12px;text-align:center}}
+</style></head><body><main>
+<div class="header"><h1>QBitLeap BTC</h1><a class="refresh" href="/">Refresh</a></div>{notice}
+<details class="card" open><summary><h2>Mining Services</h2></summary><div class="card-body">
+{service_row("Qbit Core", qbit_up, f"Block {qbit_height:,}" if qbit_height is not None else "Not Running")}{service_row("Bitcoin Core", bitcoin_up, f"Block {bitcoin_height:,}" if bitcoin_height is not None else "Not Running")}{service_row("AuxPoW Merge Mine", auxpow_up)}
+</div></details>
+<details class="card" open><summary><h2>Local Mining Status</h2></summary><div class="card-body">
+<div class="metric-row"><span>Status</span><span class="status-text {overall_cls}">{html.escape(overall_text)}</span></div>
+<div class="metric-row"><span>Connected Miners</span><span class="metric-value">{int(telemetry.get("connected_workers",0)) if telemetry else 0}</span></div>
+<div class="metric-row"><span>Total Hashrate</span><span class="metric-value">{format_hashrate(total_rate)}</span></div>
+{f'<div class="metric-row"><span>Expected Hashrate</span><span class="metric-value">{format_hashrate(expected_total)}</span></div>' if expected_total else ''}
+<div class="metric-row"><span>Rejected Shares</span><span class="metric-value">{rejects:.1f}%</span></div>
+<div class="metric-row"><span>Last Share Received</span><span class="metric-value">{age_text(last_share) if last_share else "—"}</span></div>
+</div></details>
+<details class="card" open><summary><h2>Connected Miners</h2></summary><div class="card-body">{''.join(worker_rows)}</div></details>
+<details class="card"><summary><h2>Qbit Blocks Found ({len(history.get("qbit",[]))})</h2></summary><div class="card-body">{block_history_rows(history.get("qbit",[]),"No Qbit blocks found yet.")}</div></details>
+<details class="card"><summary><h2>Bitcoin Blocks Found ({len(history.get("bitcoin",[]))})</h2></summary><div class="card-body">{block_history_rows(history.get("bitcoin",[]),"No Bitcoin blocks found yet.")}</div></details>
+<details class="card"><summary><h2>Payout Addresses</h2></summary><div class="card-body"><form method="post" action="/save">
+<label for="qbt">QBT Payout Address</label><input id="qbt" name="qbt_payout" value="{qbt}" autocomplete="off" required>
+<label for="btc">BTC Payout Address</label><input id="btc" name="btc_payout" value="{btc}" autocomplete="off" required>
+<label for="expected">Expected Local Miner Hashrates (TH/s)</label><textarea id="expected" name="expected_hashrates" placeholder="thor-p2=10&#10;magic-40t=40">{expected}</textarea>
+<button type="submit">Save</button></form><p class="muted">Use the exact worker name from the miner configuration, one worker per line.</p></div></details>
+<p class="footer">Last updated: {html.escape(updated)} · automatic refresh every 5 minutes</p></main></body></html>""".encode("utf-8")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -314,6 +344,8 @@ class Handler(BaseHTTPRequestHandler):
             form = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
             qbt = form.get("qbt_payout", [""])[0].strip()
             btc = form.get("btc_payout", [""])[0].strip()
+            expected_raw = form.get("expected_hashrates", [""])[0].strip()
+            expected_rates = parse_expected_text(expected_raw)
             if not ADDRESS_RE.fullmatch(qbt):
                 raise ValueError("Enter a valid QBT payout address.")
             if not ADDRESS_RE.fullmatch(btc):
@@ -329,6 +361,7 @@ class Handler(BaseHTTPRequestHandler):
 
             atomic_write(QBT_FILE, qbt)
             atomic_write(BTC_FILE, btc)
+            atomic_write(EXPECTED_FILE, json.dumps(expected_rates, sort_keys=True))
             body = render(self.headers, message="Mining payout addresses saved.")
             code = 200
         except ValueError as exc:

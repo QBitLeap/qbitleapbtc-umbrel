@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.4.4"
+version: "0.4.5"
 port: 8080
 
 description: >-
@@ -25,7 +25,7 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 gallery: []
 
 releaseNotes: >-
-  Raise the AuxPoW Stratum startup, minimum vardiff, and advertised share difficulty to 500,000 for NiceHash SHA256ASICBoost pool verification compatibility.
+  Refocus the dashboard on local miner health with per-miner status, expected hashrates, reject percentage, last-share monitoring, and separate persistent Qbit and Bitcoin block histories.
 
 dependencies:
   - bitcoin
