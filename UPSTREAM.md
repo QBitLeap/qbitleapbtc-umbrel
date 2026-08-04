@@ -15,3 +15,7 @@ the pinned commit.
 Updating upstream requires reviewing a newer official commit, replacing the
 vendored directory with that commit's tree, updating the commit above and in the
 integrity workflow, and committing those changes together.
+
+The scheduled upstream-update workflow checks official `main` weekly. When a
+new commit is available, it replaces the snapshot and opens or refreshes a pull
+request. Updates are never merged automatically.

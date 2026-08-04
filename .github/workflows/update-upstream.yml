@@ -1,0 +1,98 @@
+name: Propose upstream update
+
+on:
+  schedule:
+    - cron: "17 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-qbit-mining-bootstrap
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: https://github.com/Qbit-Org/qbit-mining-bootstrap.git
+  PINNED_COMMIT: 2cd9fa4049c2064e34285de77cce4c0731fe657d
+  VENDORED_DIRECTORY: qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap
+  UPDATE_BRANCH: automation/update-qbit-mining-bootstrap
+
+jobs:
+  propose-update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch official upstream main
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --branch main --depth 1 "${UPSTREAM_REPOSITORY}" "${RUNNER_TEMP}/qbit-mining-bootstrap"
+          upstream_commit="$(git -C "${RUNNER_TEMP}/qbit-mining-bootstrap" rev-parse HEAD)"
+          printf 'UPSTREAM_COMMIT=%s\n' "${upstream_commit}" >> "${GITHUB_ENV}"
+          if [[ "${upstream_commit}" == "${PINNED_COMMIT}" ]]; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Stop when the pin is current
+        if: steps.upstream.outputs.changed == 'false'
+        run: echo "The vendored upstream pin is current."
+
+      - name: Replace the vendored snapshot
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rsync -a --delete --exclude=.git/ \
+            "${RUNNER_TEMP}/qbit-mining-bootstrap/" \
+            "${VENDORED_DIRECTORY}/"
+          sed -i "s/${PINNED_COMMIT}/${UPSTREAM_COMMIT}/g" UPSTREAM.md
+          sed -i "s/${PINNED_COMMIT}/${UPSTREAM_COMMIT}/g" .github/workflows/verify-upstream.yml
+          sed -i "s/${PINNED_COMMIT}/${UPSTREAM_COMMIT}/g" .github/workflows/update-upstream.yml
+
+      - name: Verify proposed snapshot
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C "${RUNNER_TEMP}/qbit-mining-bootstrap" ls-tree -r HEAD > "${RUNNER_TEMP}/official-tree.txt"
+          git add --all
+          repository_tree="$(git write-tree)"
+          git ls-tree -r "${repository_tree}" -- "${VENDORED_DIRECTORY}" \
+            | sed "s#	${VENDORED_DIRECTORY}/#	#" \
+            > "${RUNNER_TEMP}/vendored-tree.txt"
+          diff -u "${RUNNER_TEMP}/official-tree.txt" "${RUNNER_TEMP}/vendored-tree.txt"
+
+      - name: Commit and push update branch
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "${UPDATE_BRANCH}"
+          git commit -m "Update qbit-mining-bootstrap upstream to ${UPSTREAM_COMMIT:0:12}"
+          git push --force-with-lease origin "${UPDATE_BRANCH}"
+
+          existing_pr="$(gh pr list --head "${UPDATE_BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          if [[ -z "${existing_pr}" ]]; then
+            gh pr create \
+              --base main \
+              --head "${UPDATE_BRANCH}" \
+              --title "Update qbit-mining-bootstrap upstream" \
+              --body "Automated proposal to update the vendored official upstream from \`${PINNED_COMMIT}\` to \`${UPSTREAM_COMMIT}\`. Review upstream changes and required Umbrel compatibility before merging."
+          else
+            gh pr comment "${existing_pr}" \
+              --body "Refreshed this proposal to official upstream commit \`${UPSTREAM_COMMIT}\`."
+          fi
