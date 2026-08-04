@@ -1,4 +1,4 @@
-# Official Upstream Service Map
+# Upstream Integration
 
 This document maps the services provided by the official
 `Qbit-Org/qbit-mining-bootstrap` subtree and identifies how QBitLeap BTC will
