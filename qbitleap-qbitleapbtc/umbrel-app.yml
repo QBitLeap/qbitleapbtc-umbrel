@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.4.6"
+version: "0.4.7"
 port: 8080
 
 description: >-
@@ -25,7 +25,8 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 gallery: []
 
 releaseNotes: >-
-  Refocus the dashboard on local miner health with per-miner status, expected hashrates, reject percentage, last-share monitoring, and separate persistent Qbit and Bitcoin block histories.
+  Detect connected miner worker names automatically and request an expected
+  hashrate for each miner instead of showing manual example entries.
 
 dependencies:
   - bitcoin

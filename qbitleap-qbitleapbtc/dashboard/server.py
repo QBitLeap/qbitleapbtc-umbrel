@@ -2,6 +2,7 @@
 import base64
 import html
 import json
+import math
 import os
 import re
 import socket
@@ -162,29 +163,40 @@ def format_number(value, decimals=2):
         return f"{number:,.0f}"
     return f"{number:.{decimals}f}"
 
-def parse_expected_text(value):
-    result = {}
-    for raw in value.splitlines():
-        raw = raw.strip()
-        if not raw or raw.startswith("#"):
-            continue
-        if "=" not in raw:
-            raise ValueError("Expected hashrates must use worker=TH/s, one per line.")
-        worker, rate = (part.strip() for part in raw.split("=", 1))
-        if not worker or float(rate) <= 0:
-            raise ValueError("Each expected miner hashrate must be greater than zero.")
-        result[worker] = float(rate) * 1_000_000_000_000
-    return result
-
-
-def expected_text():
+def read_expected_rates():
     try:
         data = json.loads(EXPECTED_FILE.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            return ""
-        return "\n".join(f"{name}={float(rate) / 1_000_000_000_000:g}" for name, rate in sorted(data.items()))
+            return {}
+        result = {}
+        for name, raw_rate in data.items():
+            rate = float(raw_rate)
+            if math.isfinite(rate) and rate > 0:
+                result[str(name)] = rate
+        return result
     except Exception:
-        return ""
+        return {}
+
+
+def parse_expected_fields(workers, rates):
+    if len(workers) != len(rates):
+        raise ValueError("Expected miner hashrates could not be read.")
+    result = {}
+    for worker, raw_rate in zip(workers, rates):
+        worker = worker.strip()
+        raw_rate = raw_rate.strip()
+        if not worker or not raw_rate:
+            continue
+        if worker in result:
+            raise ValueError("Each miner may have only one expected hashrate.")
+        try:
+            rate = float(raw_rate)
+        except ValueError as exc:
+            raise ValueError("Expected miner hashrates must be numbers in TH/s.") from exc
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError("Each expected miner hashrate must be greater than zero.")
+        result[worker] = rate * 1_000_000_000_000
+    return result
 
 
 def age_text(timestamp):
@@ -251,7 +263,7 @@ def service_row(name, active, status=""):
 def render(headers, message="", error=""):
     qbt = html.escape(read_text(QBT_FILE), quote=True)
     btc = html.escape(read_text(BTC_FILE), quote=True)
-    expected = html.escape(expected_text())
+    configured_expected = read_expected_rates()
     qbit_up, qbit_height = chain_status(qbit_rpc)
     bitcoin_up, bitcoin_height = chain_status(bitcoin_rpc)
     auxpow_up = auxpow_connected()
@@ -284,6 +296,32 @@ def render(headers, message="", error=""):
     if not worker_rows:
         worker_rows.append('<p class="muted empty">No local miners connected.</p>')
 
+    detected_names = {
+        str(worker.get("name", "")).strip()
+        for worker in workers
+        if str(worker.get("name", "")).strip()
+    }
+    expected_names = sorted(detected_names | set(configured_expected))
+    missing_expected = sorted(detected_names - set(configured_expected))
+    expected_rows = []
+    for name in expected_names:
+        expected_rate = configured_expected.get(name)
+        value = f'{expected_rate / 1_000_000_000_000:g}' if expected_rate else ""
+        prompt = '<span class="expected-prompt">Expected hashrate needed</span>' if name in detected_names and not expected_rate else ""
+        expected_rows.append(
+            '<div class="expected-row">'
+            f'<div class="expected-title"><strong>{html.escape(name)}</strong>{prompt}</div>'
+            f'<input type="hidden" name="expected_worker" value="{html.escape(name, quote=True)}">'
+            f'<div class="rate-input"><input type="number" name="expected_rate" value="{html.escape(value, quote=True)}" min="0" step="any" inputmode="decimal" placeholder="Enter expected rate"><span>TH/s</span></div>'
+            '</div>'
+        )
+    if not expected_rows:
+        expected_rows.append('<p class="muted empty">Connect a miner to add its expected hashrate.</p>')
+
+    if not message and not error and missing_expected:
+        names = ", ".join(missing_expected)
+        notice = f'<div class="notice warning">Set the expected hashrate for: {html.escape(names)}.</div>'
+
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="300"><title>QBitLeap BTC</title>
 <style>
@@ -294,8 +332,9 @@ h2{{margin:0;font-size:17px}} summary{{position:relative;display:flex;align-item
 .service-row{{display:flex;justify-content:center;padding:12px 0;text-align:center}} .service-row+.service-row,.metric-row+.metric-row,.worker-row+.worker-row,.history-row+.history-row{{border-top:1px solid var(--line)}} .service-line{{display:inline-flex;align-items:center;gap:10px;font-weight:650}} .service-dot{{width:12px;height:12px;border-radius:3px;background:currentColor;flex:0 0 auto}}
 .metric-row,.history-row{{display:flex;justify-content:space-between;align-items:center;gap:18px;padding:12px 0}} .metric-value{{font-weight:700}} .status-text{{font-weight:700}} .up{{color:var(--good)}} .warn{{color:var(--warn)}} .down{{color:var(--bad)}}
 .worker-row{{padding:14px 0}} .worker-title{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}} .worker-state{{margin-left:auto;font-weight:650}} .worker-detail{{color:var(--muted);font-size:13px;margin:7px 0 0 22px}}
-label{{display:block;font-weight:600;margin:0 0 8px}} input,textarea{{width:100%;border:1px solid var(--line);border-radius:9px;padding:12px;margin-bottom:18px;background:#0e141e;color:var(--text);font:inherit}} textarea{{min-height:100px;resize:vertical}} button,.refresh{{border:0;border-radius:9px;padding:10px 16px;background:var(--accent);color:#08101f;font:inherit;font-weight:700;cursor:pointer;text-decoration:none}}
-.muted{{color:var(--muted);font-size:13px;margin-top:12px}} .compact{{margin:3px 0 0}} .empty{{text-align:center;padding:12px 0}} .notice{{border-radius:9px;padding:11px 13px;margin-bottom:18px}} .success{{background:#123522;color:#8ce7b2}} .error{{background:#3a181c;color:#ff9ca5}} .footer{{color:var(--muted);font-size:12px;text-align:center}}
+label{{display:block;font-weight:600;margin:0 0 8px}} input{{width:100%;border:1px solid var(--line);border-radius:9px;padding:12px;margin-bottom:18px;background:#0e141e;color:var(--text);font:inherit}} button,.refresh{{border:0;border-radius:9px;padding:10px 16px;background:var(--accent);color:#08101f;font:inherit;font-weight:700;cursor:pointer;text-decoration:none}}
+.expected-row{{padding:12px 0}} .expected-row+.expected-row{{border-top:1px solid var(--line)}} .expected-title{{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px}} .expected-prompt{{color:var(--warn);font-size:13px}} .rate-input{{display:flex;align-items:center;gap:10px}} .rate-input input{{margin:0}} .rate-input span{{color:var(--muted);white-space:nowrap}}
+.muted{{color:var(--muted);font-size:13px;margin-top:12px}} .compact{{margin:3px 0 0}} .empty{{text-align:center;padding:12px 0}} .notice{{border-radius:9px;padding:11px 13px;margin-bottom:18px}} .success{{background:#123522;color:#8ce7b2}} .warning{{background:#392d13;color:#f4cd78}} .error{{background:#3a181c;color:#ff9ca5}} .footer{{color:var(--muted);font-size:12px;text-align:center}}
 </style></head><body><main>
 <div class="header"><h1>QBitLeap BTC</h1><a class="refresh" href="/">Refresh</a></div>{notice}
 <details class="card" open><summary><h2>Mining Services</h2></summary><div class="card-body">
@@ -312,11 +351,11 @@ label{{display:block;font-weight:600;margin:0 0 8px}} input,textarea{{width:100%
 <details class="card" open><summary><h2>Connected Miners</h2></summary><div class="card-body">{''.join(worker_rows)}</div></details>
 <details class="card"><summary><h2>Qbit Blocks Found ({len(history.get("qbit",[]))})</h2></summary><div class="card-body">{block_history_rows(history.get("qbit",[]),"No Qbit blocks found yet.")}</div></details>
 <details class="card"><summary><h2>Bitcoin Blocks Found ({len(history.get("bitcoin",[]))})</h2></summary><div class="card-body">{block_history_rows(history.get("bitcoin",[]),"No Bitcoin blocks found yet.")}</div></details>
-<details class="card"><summary><h2>Payout Addresses</h2></summary><div class="card-body"><form method="post" action="/save">
+<details class="card"{' open' if missing_expected else ''}><summary><h2>Payout Addresses &amp; Miner Expectations</h2></summary><div class="card-body"><form method="post" action="/save">
 <label for="qbt">QBT Payout Address</label><input id="qbt" name="qbt_payout" value="{qbt}" autocomplete="off" required>
 <label for="btc">BTC Payout Address</label><input id="btc" name="btc_payout" value="{btc}" autocomplete="off" required>
-<label for="expected">Expected Local Miner Hashrates (TH/s)</label><textarea id="expected" name="expected_hashrates" placeholder="thor-p2=10&#10;magic-40t=40">{expected}</textarea>
-<button type="submit">Save</button></form><p class="muted">Use the exact worker name from the miner configuration, one worker per line.</p></div></details>
+<label>Expected Local Miner Hashrates</label>{''.join(expected_rows)}
+<button type="submit">Save</button></form><p class="muted">Miners appear here automatically after the AuxPoW server receives their worker identity.</p></div></details>
 <p class="footer">Last updated: {html.escape(updated)} · automatic refresh every 5 minutes</p></main></body></html>""".encode("utf-8")
 
 
@@ -344,8 +383,10 @@ class Handler(BaseHTTPRequestHandler):
             form = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
             qbt = form.get("qbt_payout", [""])[0].strip()
             btc = form.get("btc_payout", [""])[0].strip()
-            expected_raw = form.get("expected_hashrates", [""])[0].strip()
-            expected_rates = parse_expected_text(expected_raw)
+            expected_rates = parse_expected_fields(
+                form.get("expected_worker", []),
+                form.get("expected_rate", []),
+            )
             if not ADDRESS_RE.fullmatch(qbt):
                 raise ValueError("Enter a valid QBT payout address.")
             if not ADDRESS_RE.fullmatch(btc):
