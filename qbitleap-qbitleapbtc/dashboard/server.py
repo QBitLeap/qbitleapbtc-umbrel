@@ -17,6 +17,7 @@ PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/config"))
 QBT_FILE = CONFIG_DIR / "qbt-payout-address.txt"
 BTC_FILE = CONFIG_DIR / "btc-payout-address.txt"
+FRACTAL_FILE = CONFIG_DIR / "fractal-payout-address.txt"
 EXPECTED_FILE = CONFIG_DIR / "miner-expected-hashrates.json"
 TELEMETRY_FILE = Path(os.environ.get("TELEMETRY_FILE", "/telemetry/telemetry.json"))
 
@@ -31,6 +32,11 @@ BITCOIN_RPC_HOST = os.environ.get("BITCOIN_RPC_HOST", "")
 BITCOIN_RPC_PORT = int(os.environ.get("BITCOIN_RPC_PORT", "8332"))
 BITCOIN_RPC_USER = os.environ.get("BITCOIN_RPC_USER", "")
 BITCOIN_RPC_PASSWORD = os.environ.get("BITCOIN_RPC_PASSWORD", "")
+
+FRACTAL_RPC_HOST = os.environ.get("FRACTAL_RPC_HOST", "")
+FRACTAL_RPC_PORT = int(os.environ.get("FRACTAL_RPC_PORT", "8332"))
+FRACTAL_RPC_USER = os.environ.get("FRACTAL_RPC_USER", "")
+FRACTAL_RPC_PASSWORD = os.environ.get("FRACTAL_RPC_PASSWORD", "")
 
 ADDRESS_RE = re.compile(r"^[A-Za-z0-9]{14,120}$")
 
@@ -101,6 +107,17 @@ def bitcoin_rpc(method, params=None):
         BITCOIN_RPC_PORT,
         BITCOIN_RPC_USER,
         BITCOIN_RPC_PASSWORD,
+        method,
+        params,
+    )
+
+
+def fractal_rpc(method, params=None):
+    return rpc_call(
+        FRACTAL_RPC_HOST,
+        FRACTAL_RPC_PORT,
+        FRACTAL_RPC_USER,
+        FRACTAL_RPC_PASSWORD,
         method,
         params,
     )
@@ -263,9 +280,11 @@ def service_row(name, active, status=""):
 def render(headers, message="", error=""):
     qbt = html.escape(read_text(QBT_FILE), quote=True)
     btc = html.escape(read_text(BTC_FILE), quote=True)
+    fractal = html.escape(read_text(FRACTAL_FILE), quote=True)
     configured_expected = read_expected_rates()
     qbit_up, qbit_height = chain_status(qbit_rpc)
     bitcoin_up, bitcoin_height = chain_status(bitcoin_rpc)
+    fractal_up, fractal_height = chain_status(fractal_rpc)
     auxpow_up = auxpow_connected()
     telemetry = read_telemetry()
     workers = telemetry.get("workers", []) if telemetry else []
@@ -338,7 +357,7 @@ label{{display:block;font-weight:600;margin:0 0 8px}} input{{width:100%;border:1
 </style></head><body><main>
 <div class="header"><h1>QBitLeap BTC</h1><a class="refresh" href="/">Refresh</a></div>{notice}
 <details class="card" open><summary><h2>Mining Services</h2></summary><div class="card-body">
-{service_row("Qbit Core", qbit_up, f"Block {qbit_height:,}" if qbit_height is not None else "Not Running")}{service_row("Bitcoin Core", bitcoin_up, f"Block {bitcoin_height:,}" if bitcoin_height is not None else "Not Running")}{service_row("AuxPoW Merge Mine", auxpow_up)}
+{service_row("Qbit Core", qbit_up, f"Block {qbit_height:,}" if qbit_height is not None else "Not Running")}{service_row("Bitcoin Core", bitcoin_up, f"Block {bitcoin_height:,}" if bitcoin_height is not None else "Not Running")}{service_row("Fractal Bitcoin Core", fractal_up, f"Block {fractal_height:,}" if fractal_height is not None else "Not Running")}{service_row("AuxPoW Merge Mine", auxpow_up)}
 </div></details>
 <details class="card" open><summary><h2>Local Mining Status</h2></summary><div class="card-body">
 <div class="metric-row"><span>Status</span><span class="status-text {overall_cls}">{html.escape(overall_text)}</span></div>
@@ -350,10 +369,12 @@ label{{display:block;font-weight:600;margin:0 0 8px}} input{{width:100%;border:1
 </div></details>
 <details class="card" open><summary><h2>Connected Miners</h2></summary><div class="card-body">{''.join(worker_rows)}</div></details>
 <details class="card"><summary><h2>Qbit Blocks Found ({len(history.get("qbit",[]))})</h2></summary><div class="card-body">{block_history_rows(history.get("qbit",[]),"No Qbit blocks found yet.")}</div></details>
+<details class="card"><summary><h2>Fractal Blocks Found ({len(history.get("fractal",[]))})</h2></summary><div class="card-body">{block_history_rows(history.get("fractal",[]),"No Fractal blocks found yet.")}</div></details>
 <details class="card"><summary><h2>Bitcoin Blocks Found ({len(history.get("bitcoin",[]))})</h2></summary><div class="card-body">{block_history_rows(history.get("bitcoin",[]),"No Bitcoin blocks found yet.")}</div></details>
 <details class="card"{' open' if missing_expected else ''}><summary><h2>Payout Addresses &amp; Miner Expectations</h2></summary><div class="card-body"><form method="post" action="/save">
 <label for="qbt">QBT Payout Address</label><input id="qbt" name="qbt_payout" value="{qbt}" autocomplete="off" required>
 <label for="btc">BTC Payout Address</label><input id="btc" name="btc_payout" value="{btc}" autocomplete="off" required>
+<label for="fractal">Fractal BTC Payout Address</label><input id="fractal" name="fractal_payout" value="{fractal}" autocomplete="off" required>
 <label>Expected Local Miner Hashrates</label>{''.join(expected_rows)}
 <button type="submit">Save</button></form><p class="muted">Miners appear here automatically after the AuxPoW server receives their worker identity.</p></div></details>
 <p class="footer">Last updated: {html.escape(updated)} · automatic refresh every 5 minutes</p></main></body></html>""".encode("utf-8")
@@ -383,6 +404,7 @@ class Handler(BaseHTTPRequestHandler):
             form = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
             qbt = form.get("qbt_payout", [""])[0].strip()
             btc = form.get("btc_payout", [""])[0].strip()
+            fractal = form.get("fractal_payout", [""])[0].strip()
             expected_rates = parse_expected_fields(
                 form.get("expected_worker", []),
                 form.get("expected_rate", []),
@@ -391,6 +413,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Enter a valid QBT payout address.")
             if not ADDRESS_RE.fullmatch(btc):
                 raise ValueError("Enter a valid BTC payout address.")
+            if not ADDRESS_RE.fullmatch(fractal):
+                raise ValueError("Enter a valid Fractal BTC payout address.")
 
             qbit_result = qbit_rpc("validateaddress", [qbt])
             if not isinstance(qbit_result, dict) or not qbit_result.get("isvalid"):
@@ -400,8 +424,13 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(bitcoin_result, dict) or not bitcoin_result.get("isvalid"):
                 raise ValueError("The BTC payout address is not valid for this Bitcoin network.")
 
+            fractal_result = fractal_rpc("validateaddress", [fractal])
+            if not isinstance(fractal_result, dict) or not fractal_result.get("isvalid"):
+                raise ValueError("The Fractal BTC payout address is not valid for this Fractal network.")
+
             atomic_write(QBT_FILE, qbt)
             atomic_write(BTC_FILE, btc)
+            atomic_write(FRACTAL_FILE, fractal)
             atomic_write(EXPECTED_FILE, json.dumps(expected_rates, sort_keys=True))
             body = render(self.headers, message="Mining payout addresses saved.")
             code = 200

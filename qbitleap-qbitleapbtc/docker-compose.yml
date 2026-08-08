@@ -8,7 +8,7 @@ services:
       PROXY_AUTH_ADD: "false"
 
   dashboard:
-    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.4.7
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.0
     restart: unless-stopped
     environment:
       DASHBOARD_PORT: "8080"
@@ -20,6 +20,10 @@ services:
       BITCOIN_RPC_PORT: ${APP_BITCOIN_RPC_PORT}
       BITCOIN_RPC_USER: ${APP_BITCOIN_RPC_USER}
       BITCOIN_RPC_PASSWORD: ${APP_BITCOIN_RPC_PASS}
+      FRACTAL_RPC_HOST: ${APP_FRACTAL_RPC_HOST}
+      FRACTAL_RPC_PORT: ${APP_FRACTAL_RPC_PORT}
+      FRACTAL_RPC_USER: ${APP_FRACTAL_RPC_USER}
+      FRACTAL_RPC_PASSWORD: ${APP_FRACTAL_RPC_PASS}
       AUXPOW_HOST: auxpow
       AUXPOW_PORT: "3335"
       CONFIG_DIR: /config
@@ -56,9 +60,11 @@ services:
 
         touch /config/qbt-payout-address.txt
         touch /config/btc-payout-address.txt
+        touch /config/fractal-payout-address.txt
         chmod 600 /config/qbit.conf
         chmod 600 /config/qbt-payout-address.txt
         chmod 600 /config/btc-payout-address.txt
+        chmod 600 /config/fractal-payout-address.txt
 
   qbitd:
     image: ghcr.io/qbitleap/qbitleapbtc-qbitd:0.1.0
@@ -118,7 +124,7 @@ services:
       start_period: 30s
 
   auxpow:
-    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.4.6
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.0
     restart: unless-stopped
 
     depends_on:
@@ -158,6 +164,7 @@ services:
       QBIT_RPC_USER: qbitrpc
       QBIT_RPC_PASSWORD: ${APP_PASSWORD}
       QBIT_MINER_ADDRESS_FILE: /config/qbt-payout-address.txt
+      QBIT_AUXPOW_CHAIN_ID: "47"
       BITCOIN_CHAIN: mainnet
       BITCOIN_EXPECTED_GENESIS_HASH: 000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
       BITCOIN_RPC_HOST: ${APP_BITCOIN_NODE_IP}
@@ -165,6 +172,15 @@ services:
       BITCOIN_RPC_USER: ${APP_BITCOIN_RPC_USER}
       BITCOIN_RPC_PASSWORD: ${APP_BITCOIN_RPC_PASS}
       BITCOIN_MINER_ADDRESS_FILE: /config/btc-payout-address.txt
+      FRACTAL_CHAIN: mainnet
+      FRACTAL_RPC_HOST: ${APP_FRACTAL_RPC_HOST}
+      FRACTAL_RPC_PORT: ${APP_FRACTAL_RPC_PORT}
+      FRACTAL_RPC_USER: ${APP_FRACTAL_RPC_USER}
+      FRACTAL_RPC_PASSWORD: ${APP_FRACTAL_RPC_PASS}
+      FRACTAL_AUXPOW_CHAIN_ID: ${APP_FRACTAL_AUXPOW_CHAIN_ID}
+      FRACTAL_MINER_ADDRESS_FILE: /config/fractal-payout-address.txt
+      AUXPOW_MERKLE_SIZE: "16"
+      AUXPOW_MERKLE_NONCE: "0"
       AUXPOW_ADDRESS_POLL_SECONDS: "2"
       AUXPOW_TELEMETRY_FILE: /telemetry/telemetry.json
 

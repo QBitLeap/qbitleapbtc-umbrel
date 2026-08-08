@@ -13,8 +13,9 @@ COPY qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap/lab/auxpow/*.py /app/la
 # QBitLeap BTC's thin Umbrel startup and telemetry wrapper.
 COPY qbitleap-qbitleapbtc/auxpow/start-auxpow.sh /usr/local/bin/start-auxpow
 COPY qbitleap-qbitleapbtc/auxpow/telemetry_runner.py /app/telemetry_runner.py
+COPY qbitleap-qbitleapbtc/auxpow/multi_auxpow_coordinator.py /app/multi_auxpow_coordinator.py
 
-RUN chmod 0755 /usr/local/bin/start-auxpow /app/telemetry_runner.py
+RUN chmod 0755 /usr/local/bin/start-auxpow /app/telemetry_runner.py /app/multi_auxpow_coordinator.py
 
 ENV PYTHONPATH=/app:/opt/qbit-functional
 

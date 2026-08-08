@@ -24,8 +24,8 @@ stats = {
     "status": "starting", "connected_workers": 0, "submitted_shares": 0,
     "accepted_shares": 0, "rejected_shares": 0, "current_hashrate_hs": 0.0,
     "best_share_difficulty": 0.0, "current_difficulty": STARTUP_DIFF,
-    "qbit_blocks_found": 0, "bitcoin_blocks_found": 0, "workers": [],
-    "block_history": {"qbit": [], "bitcoin": []}, "updated_at": 0,
+    "qbit_blocks_found": 0, "fractal_blocks_found": 0, "bitcoin_blocks_found": 0, "workers": [],
+    "block_history": {"qbit": [], "fractal": [], "bitcoin": []}, "updated_at": 0,
 }
 lock = threading.Lock()
 worker_totals = {}
@@ -105,10 +105,10 @@ def recompute_totals():
                   "qbit_blocks_found":qbit,"bitcoin_blocks_found":bitcoin,"current_hashrate_hs":float(hashrate),"workers":workers})
 
 def record_block(chain):
-    history = load_json(HISTORY_FILE, {"qbit":[],"bitcoin":[]})
-    if not isinstance(history, dict): history = {"qbit":[],"bitcoin":[]}
+    history = load_json(HISTORY_FILE, {"qbit":[],"fractal":[],"bitcoin":[]})
+    if not isinstance(history, dict): history = {"qbit":[],"fractal":[],"bitcoin":[]}
     history.setdefault(chain, [])
-    prefix = "QBIT" if chain == "qbit" else "BITCOIN"
+    prefix = {"qbit": "QBIT", "fractal": "FRACTAL", "bitcoin": "BITCOIN"}[chain]
     history[chain].insert(0, {"height":rpc_height(prefix),"found_at":int(time.time()),"worker":last_candidate["worker"],"hash":last_candidate["hash"]})
     history[chain] = history[chain][:100]
     atomic_write(HISTORY_FILE, history); stats["block_history"] = history
@@ -117,7 +117,7 @@ def publish_loop():
     while True:
         with lock:
             stats["connected_workers"] = count_connected_workers(); stats["status"] = "connected" if stats["connected_workers"] else "listening"
-            stats["block_history"] = load_json(HISTORY_FILE, {"qbit":[],"bitcoin":[]}); stats["updated_at"] = int(time.time())
+            stats["block_history"] = load_json(HISTORY_FILE, {"qbit":[],"fractal":[],"bitcoin":[]}); stats["updated_at"] = int(time.time())
             recompute_totals(); payload = dict(stats)
         atomic_write(TELEMETRY_FILE, payload); time.sleep(2)
 
@@ -131,7 +131,7 @@ def process_line(line):
                 "qbit":int(match.group("qbit_accepted")),"bitcoin":previous.get("bitcoin",0),
                 "accepted_per_sec":float(match.group("accepted_per_sec")),"difficulty":previous.get("difficulty",stats["current_difficulty"]),
                 "last_share_at":previous.get("last_share_at",0)}
-        if "accepted share" in line or "qbit block candidate" in line:
+        if "accepted share" in line or "qbit block candidate" in line or "child block candidate" in line:
             share = SHARE_RE.search(line)
             if share:
                 user, hash_hex = share.group("user"), share.group("hash")
@@ -146,11 +146,12 @@ def process_line(line):
                 if last_candidate["worker"] in worker_totals: worker_totals[last_candidate["worker"]]["difficulty"] = value
             except ValueError: pass
         if "qbit accepted AuxPoW block" in line: record_block("qbit")
-        if "parent submit attempted after qbit acceptance" in line and "result=None" in line: record_block("bitcoin")
+        if "fractal accepted AuxPoW block" in line: record_block("fractal"); stats["fractal_blocks_found"] += 1
+        if "parent submit accepted after child evaluation" in line: record_block("bitcoin")
         recompute_totals()
 
 def main():
-    child = subprocess.Popen([sys.executable,"-m","lab.auxpow.auxpow_coordinator"],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+    child = subprocess.Popen([sys.executable,"-m","multi_auxpow_coordinator"],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
     def forward(signum,_frame):
         if child.poll() is None: child.send_signal(signum)
     signal.signal(signal.SIGTERM,forward); signal.signal(signal.SIGINT,forward)
