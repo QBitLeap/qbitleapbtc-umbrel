@@ -374,7 +374,7 @@ label{{display:block;font-weight:600;margin:0 0 8px}} input{{width:100%;border:1
 <details class="card"{' open' if missing_expected else ''}><summary><h2>Payout Addresses &amp; Miner Expectations</h2></summary><div class="card-body"><form method="post" action="/save">
 <label for="qbt">QBT Payout Address</label><input id="qbt" name="qbt_payout" value="{qbt}" autocomplete="off" required>
 <label for="btc">BTC Payout Address</label><input id="btc" name="btc_payout" value="{btc}" autocomplete="off" required>
-<label for="fractal">Fractal BTC Payout Address</label><input id="fractal" name="fractal_payout" value="{fractal}" autocomplete="off" required>
+<label for="fractal">Fractal BTC Payout Address (optional)</label><input id="fractal" name="fractal_payout" value="{fractal}" autocomplete="off">
 <label>Expected Local Miner Hashrates</label>{''.join(expected_rows)}
 <button type="submit">Save</button></form><p class="muted">Miners appear here automatically after the AuxPoW server receives their worker identity.</p></div></details>
 <p class="footer">Last updated: {html.escape(updated)} · automatic refresh every 5 minutes</p></main></body></html>""".encode("utf-8")
@@ -413,7 +413,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Enter a valid QBT payout address.")
             if not ADDRESS_RE.fullmatch(btc):
                 raise ValueError("Enter a valid BTC payout address.")
-            if not ADDRESS_RE.fullmatch(fractal):
+            if fractal and not ADDRESS_RE.fullmatch(fractal):
                 raise ValueError("Enter a valid Fractal BTC payout address.")
 
             qbit_result = qbit_rpc("validateaddress", [qbt])
@@ -424,9 +424,10 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(bitcoin_result, dict) or not bitcoin_result.get("isvalid"):
                 raise ValueError("The BTC payout address is not valid for this Bitcoin network.")
 
-            fractal_result = fractal_rpc("validateaddress", [fractal])
-            if not isinstance(fractal_result, dict) or not fractal_result.get("isvalid"):
-                raise ValueError("The Fractal BTC payout address is not valid for this Fractal network.")
+            if fractal:
+                fractal_result = fractal_rpc("validateaddress", [fractal])
+                if not isinstance(fractal_result, dict) or not fractal_result.get("isvalid"):
+                    raise ValueError("The Fractal BTC payout address is not valid for this Fractal network.")
 
             atomic_write(QBT_FILE, qbt)
             atomic_write(BTC_FILE, btc)

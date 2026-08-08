@@ -25,6 +25,10 @@ QBIT_CHAIN_ID = int(os.environ.get("QBIT_AUXPOW_CHAIN_ID", "47"))
 MERKLE_SIZE = int(os.environ.get("AUXPOW_MERKLE_SIZE", "16"))
 MERKLE_NONCE = int(os.environ.get("AUXPOW_MERKLE_NONCE", "0"))
 FRACTAL_EXPECTED_GENESIS_HASH = os.environ.get("FRACTAL_EXPECTED_GENESIS_HASH", "").strip()
+FRACTAL_ADDRESS_FILE = os.environ.get(
+    "FRACTAL_MINER_ADDRESS_FILE",
+    "/config/fractal-payout-address.txt",
+)
 
 
 def merkle_height(size: int) -> int:
@@ -161,8 +165,22 @@ class MultiAuxPowStratumServer(base.AuxPowStratumServer):
         self.fractal_active = False
         self.last_fractal_status = "starting"
 
+    def reload_fractal_address(self) -> str:
+        try:
+            with open(FRACTAL_ADDRESS_FILE, "r", encoding="utf-8") as handle:
+                configured = handle.read().strip()
+        except OSError:
+            configured = self.fractal_miner_address.strip()
+        if configured != self.fractal_miner_address:
+            self.fractal_miner_address = configured
+            self.fractal_address_validated = False
+        return configured
+
     def fractal_ready(self) -> tuple[bool, str | None]:
         try:
+            if not self.reload_fractal_address():
+                self.last_fractal_status = "disabled (Fractal payout address not configured)"
+                return False, None
             info = self.fractal_rpc.call("getblockchaininfo")
             if not isinstance(info, dict) or info.get("chain") != "main":
                 raise RuntimeError("Fractal RPC is not on mainnet")
@@ -525,12 +543,13 @@ def main() -> int:
     base.validate_auxpow_startup(qbit_rpc, bitcoin_rpc)
     qbit_address = base.resolve_qbit_miner_address(qbit_rpc)
     bitcoin_address = base.resolve_bitcoin_miner_address(bitcoin_rpc)
-    fractal_address = base.env("FRACTAL_MINER_ADDRESS").strip()
-    if not fractal_address:
-        raise RuntimeError("FRACTAL_MINER_ADDRESS is empty")
+    fractal_address = os.environ.get("FRACTAL_MINER_ADDRESS", "").strip()
     print(f"auxpow: using qbit payout address {qbit_address}", flush=True)
     print(f"auxpow: using Bitcoin payout address {bitcoin_address.address}", flush=True)
-    print(f"auxpow: configured Fractal payout address {fractal_address}", flush=True)
+    if fractal_address:
+        print(f"auxpow: configured Fractal payout address {fractal_address}", flush=True)
+    else:
+        print("auxpow: Fractal payout address is not configured; starting Bitcoin + Qbit", flush=True)
     return MultiAuxPowStratumServer(
         qbit_rpc=qbit_rpc,
         bitcoin_rpc=bitcoin_rpc,

@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.5.0"
+version: "0.5.1"
 port: 8080
 
 description: >-
@@ -25,9 +25,9 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 gallery: []
 
 releaseNotes: >-
-  Add Fractal Bitcoin as a second AuxPoW child chain. Mining safely remains
-  on Bitcoin and Qbit while the Fractal node synchronizes, then activates
-  Fractal automatically when the node is ready.
+  Start Bitcoin and Qbit mining even when no Fractal payout address has been
+  configured. Fractal activates automatically after its address is saved and
+  its node is synchronized.
 
 dependencies:
   - bitcoin

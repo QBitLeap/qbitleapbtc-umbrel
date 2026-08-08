@@ -18,14 +18,14 @@ while :; do
   bitcoin_address="$(read_address "$BITCOIN_ADDRESS_FILE")"
   fractal_address="$(read_address "$FRACTAL_ADDRESS_FILE")"
 
-  if [ -n "$qbit_address" ] && [ -n "$bitcoin_address" ] && [ -n "$fractal_address" ]; then
+  if [ -n "$qbit_address" ] && [ -n "$bitcoin_address" ]; then
     export QBIT_MINER_ADDRESS="$qbit_address"
     export BITCOIN_MINER_ADDRESS="$bitcoin_address"
     export FRACTAL_MINER_ADDRESS="$fractal_address"
     break
   fi
 
-  echo "auxpow: waiting for Qbit, Bitcoin, and Fractal payout addresses" >&2
+  echo "auxpow: waiting for Qbit and Bitcoin payout addresses" >&2
   sleep "$POLL_SECONDS"
 done
 

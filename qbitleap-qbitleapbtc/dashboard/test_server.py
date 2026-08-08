@@ -55,7 +55,7 @@ class ExpectedHashrateTests(unittest.TestCase):
         self.assertIn("garage-miner", page)
         self.assertIn("Expected hashrate needed", page)
         self.assertIn("Fractal Bitcoin Core", page)
-        self.assertIn("Fractal BTC Payout Address", page)
+        self.assertIn("Fractal BTC Payout Address (optional)", page)
         self.assertIn("Fractal Blocks Found", page)
         self.assertIn('name="expected_rate"', page)
         self.assertNotIn("thor-p2", page)

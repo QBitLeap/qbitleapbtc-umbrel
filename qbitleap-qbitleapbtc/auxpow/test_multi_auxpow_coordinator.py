@@ -1,4 +1,7 @@
 import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 import multi_auxpow_coordinator as multi
 from lab.auxpow import auxpow_coordinator as base
@@ -49,6 +52,39 @@ class SharedAuxPowTreeTests(unittest.TestCase):
     def test_rejects_non_power_of_two_tree_size(self):
         with self.assertRaisesRegex(RuntimeError, "power of two"):
             multi.build_aux_merkle_tree(self.templates, size=15)
+
+
+class OptionalFractalAddressTests(unittest.TestCase):
+    def make_server(self):
+        server = multi.MultiAuxPowStratumServer.__new__(multi.MultiAuxPowStratumServer)
+        server.fractal_miner_address = ""
+        server.fractal_address_validated = False
+        server.last_fractal_status = "starting"
+        return server
+
+    def test_missing_address_disables_fractal_without_rpc_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            address_file = Path(directory) / "fractal-address.txt"
+            address_file.write_text("\n", encoding="utf-8")
+            server = self.make_server()
+            with patch.object(multi, "FRACTAL_ADDRESS_FILE", str(address_file)):
+                ready, best = server.fractal_ready()
+
+        self.assertFalse(ready)
+        self.assertIsNone(best)
+        self.assertIn("not configured", server.last_fractal_status)
+
+    def test_new_address_is_reloaded_without_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            address_file = Path(directory) / "fractal-address.txt"
+            address_file.write_text("bc1qexampleaddress\n", encoding="utf-8")
+            server = self.make_server()
+            with patch.object(multi, "FRACTAL_ADDRESS_FILE", str(address_file)):
+                configured = server.reload_fractal_address()
+
+        self.assertEqual(configured, "bc1qexampleaddress")
+        self.assertEqual(server.fractal_miner_address, configured)
+        self.assertFalse(server.fractal_address_validated)
 
 
 if __name__ == "__main__":
