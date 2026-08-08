@@ -6,7 +6,7 @@ A minimal Umbrel Community App for self-hosted Bitcoin AuxPoW mining on the Qbit
 
 QBitLeap BTC turns an Umbrel node into a lightweight AuxPoW mining appliance. Connect one or more SHA-256 ASIC miners, point them at the built-in Stratum server, and merge-mine Qbit and Fractal Bitcoin using the same Bitcoin proof of work.
 
-Version 0.5.1 requires the QBitLeap Fractal Bitcoin Node app. While that node is synchronizing, temporarily unavailable, or missing a payout address, the coordinator automatically continues Bitcoin + Qbit mining. Fractal is added to new jobs once its payout address is saved and its node reports that initial block download is complete.
+Version 0.5.2 requires the QBitLeap Fractal Bitcoin Node app. While that node is synchronizing, temporarily unavailable, or missing a payout address, the coordinator automatically continues Bitcoin + Qbit mining. Fractal is added to new jobs once its payout address is saved and its node reports that initial block download is complete. The dashboard shows synchronizing nodes in amber with their verification progress.
 
 The project intentionally favors simplicity over feature count.
 

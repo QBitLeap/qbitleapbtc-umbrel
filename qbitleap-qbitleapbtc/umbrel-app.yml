@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.5.1"
+version: "0.5.2"
 port: 8080
 
 description: >-
@@ -25,9 +25,8 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 gallery: []
 
 releaseNotes: >-
-  Start Bitcoin and Qbit mining even when no Fractal payout address has been
-  configured. Fractal activates automatically after its address is saved and
-  its node is synchronized.
+  Show synchronized nodes in green, nodes still synchronizing in amber with
+  progress and block height, and unavailable nodes in red.
 
 dependencies:
   - bitcoin

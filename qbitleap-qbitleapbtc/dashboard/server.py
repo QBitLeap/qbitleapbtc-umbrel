@@ -129,9 +129,11 @@ def chain_status(rpc):
         if not isinstance(info, dict):
             raise RuntimeError("Invalid blockchain status response")
         block_height = int(info.get("blocks", 0))
-        return True, block_height
+        progress = max(0.0, min(1.0, float(info.get("verificationprogress", 0))))
+        state = "syncing" if bool(info.get("initialblockdownload", False)) else "ready"
+        return state, block_height, progress
     except Exception:
-        return False, None
+        return "offline", None, None
 
 
 def auxpow_connected():
@@ -263,8 +265,8 @@ def state_badge(ok, yes_text, no_text):
     return f'<span class="state {cls}">{icon} {html.escape(text)}</span>'
 
 
-def service_row(name, active, status=""):
-    dot_class = "up" if active else "down"
+def service_row(name, state, status=""):
+    dot_class = {"ready": "up", "syncing": "warn", "offline": "down"}.get(state, "down")
     status_html = f'<span class="service-status">{html.escape(status)}</span>' if status else ""
     return (
         '<div class="service-row">'
@@ -282,9 +284,9 @@ def render(headers, message="", error=""):
     btc = html.escape(read_text(BTC_FILE), quote=True)
     fractal = html.escape(read_text(FRACTAL_FILE), quote=True)
     configured_expected = read_expected_rates()
-    qbit_up, qbit_height = chain_status(qbit_rpc)
-    bitcoin_up, bitcoin_height = chain_status(bitcoin_rpc)
-    fractal_up, fractal_height = chain_status(fractal_rpc)
+    qbit_state, qbit_height, qbit_progress = chain_status(qbit_rpc)
+    bitcoin_state, bitcoin_height, bitcoin_progress = chain_status(bitcoin_rpc)
+    fractal_state, fractal_height, fractal_progress = chain_status(fractal_rpc)
     auxpow_up = auxpow_connected()
     telemetry = read_telemetry()
     workers = telemetry.get("workers", []) if telemetry else []
@@ -357,7 +359,7 @@ label{{display:block;font-weight:600;margin:0 0 8px}} input{{width:100%;border:1
 </style></head><body><main>
 <div class="header"><h1>QBitLeap BTC</h1><a class="refresh" href="/">Refresh</a></div>{notice}
 <details class="card" open><summary><h2>Mining Services</h2></summary><div class="card-body">
-{service_row("Qbit Core", qbit_up, f"Block {qbit_height:,}" if qbit_height is not None else "Not Running")}{service_row("Bitcoin Core", bitcoin_up, f"Block {bitcoin_height:,}" if bitcoin_height is not None else "Not Running")}{service_row("Fractal Bitcoin Core", fractal_up, f"Block {fractal_height:,}" if fractal_height is not None else "Not Running")}{service_row("AuxPoW Merge Mine", auxpow_up)}
+{service_row("Qbit Core", qbit_state, f"Synchronizing {qbit_progress * 100:.2f}% · Block {qbit_height:,}" if qbit_state == "syncing" else (f"Block {qbit_height:,}" if qbit_height is not None else "Not Running"))}{service_row("Bitcoin Core", bitcoin_state, f"Synchronizing {bitcoin_progress * 100:.2f}% · Block {bitcoin_height:,}" if bitcoin_state == "syncing" else (f"Block {bitcoin_height:,}" if bitcoin_height is not None else "Not Running"))}{service_row("Fractal Bitcoin Core", fractal_state, f"Synchronizing {fractal_progress * 100:.2f}% · Block {fractal_height:,}" if fractal_state == "syncing" else (f"Block {fractal_height:,}" if fractal_height is not None else "Not Running"))}{service_row("AuxPoW Merge Mine", "ready" if auxpow_up else "offline")}
 </div></details>
 <details class="card" open><summary><h2>Local Mining Status</h2></summary><div class="card-body">
 <div class="metric-row"><span>Status</span><span class="status-text {overall_cls}">{html.escape(overall_text)}</span></div>

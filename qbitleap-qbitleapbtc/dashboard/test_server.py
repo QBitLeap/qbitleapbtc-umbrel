@@ -46,7 +46,7 @@ class ExpectedHashrateTests(unittest.TestCase):
         with (
             patch.object(server, "read_text", return_value=""),
             patch.object(server, "read_expected_rates", return_value={}),
-            patch.object(server, "chain_status", return_value=(True, 1)),
+            patch.object(server, "chain_status", return_value=("ready", 1, 1.0)),
             patch.object(server, "auxpow_connected", return_value=True),
             patch.object(server, "read_telemetry", return_value=telemetry),
         ):
@@ -60,6 +60,47 @@ class ExpectedHashrateTests(unittest.TestCase):
         self.assertIn('name="expected_rate"', page)
         self.assertNotIn("thor-p2", page)
         self.assertNotIn("magic-40t", page)
+
+    def test_chain_status_distinguishes_ready_syncing_and_offline(self):
+        self.assertEqual(
+            server.chain_status(lambda _method: {
+                "blocks": 248922,
+                "initialblockdownload": True,
+                "verificationprogress": 0.6655295,
+            }),
+            ("syncing", 248922, 0.6655295),
+        )
+        self.assertEqual(
+            server.chain_status(lambda _method: {
+                "blocks": 2000000,
+                "initialblockdownload": False,
+                "verificationprogress": 0.999999,
+            }),
+            ("ready", 2000000, 0.999999),
+        )
+        self.assertEqual(
+            server.chain_status(lambda _method: (_ for _ in ()).throw(OSError("offline"))),
+            ("offline", None, None),
+        )
+
+    def test_render_marks_a_syncing_fractal_node_as_warning(self):
+        statuses = iter([
+            ("ready", 100, 1.0),
+            ("ready", 200, 1.0),
+            ("syncing", 248922, 0.6655295),
+        ])
+        with (
+            patch.object(server, "read_text", return_value=""),
+            patch.object(server, "read_expected_rates", return_value={}),
+            patch.object(server, "chain_status", side_effect=lambda _rpc: next(statuses)),
+            patch.object(server, "auxpow_connected", return_value=True),
+            patch.object(server, "read_telemetry", return_value=None),
+        ):
+            page = server.render({}).decode("utf-8")
+
+        self.assertIn("Fractal Bitcoin Core", page)
+        self.assertIn("Synchronizing 66.55% · Block 248,922", page)
+        self.assertIn('service-dot warn', page)
 
 
 if __name__ == "__main__":
