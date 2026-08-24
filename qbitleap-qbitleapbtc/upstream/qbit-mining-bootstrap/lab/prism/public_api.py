@@ -9,7 +9,7 @@ import os
 import threading
 import time
 import urllib.parse
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -27,6 +27,14 @@ HASHES_PER_QBIT_SCALED_DIFFICULTY = (
 )
 MAX_SEARCH_LENGTH = 128
 MAX_RECIPIENT_ID_LENGTH = 256
+HASHRATE_SERIES_BUCKET_SECONDS = {"5m": 300, "1h": 3600, "1d": 86400}
+HASHRATE_SERIES_RANGE_SECONDS = {
+    "1w": 7 * 86400,
+    "1m": 30 * 86400,
+    "6m": 180 * 86400,
+    "all": None,
+}
+DEFAULT_HASHRATE_SMOOTHING_SECONDS = 30 * 60
 
 PUBLIC_ERROR_CODES = {
     "not_found": "not_found",
@@ -185,6 +193,22 @@ def public_cache_key(path: str, query: dict[str, list[str]]) -> tuple[str, tuple
     return _canonical_cache_path(path), tuple(sorted((key, tuple(values)) for key, values in query.items()))
 
 
+def _is_public_aggregate_path(path: str) -> bool:
+    """Pool-wide aggregate read models that are expensive to recompute.
+
+    Pool summary and the hashrate series scan large share-ledger ranges, and
+    the worker list aggregates a miner's recent share history, so these
+    endpoints carry a longer default shared-cache TTL than the cheap row
+    reads.
+    """
+    if path in {"/public/v1/pool-summary", "/public/v1/hashrate-series"}:
+        return True
+    if path.startswith("/public/v1/miners/"):
+        parts = path.removeprefix("/public/v1/miners/").split("/")
+        return len(parts) == 2 and parts[1] == "workers"
+    return False
+
+
 def public_cache_policy(path: str) -> PublicCachePolicy:
     if not env_bool("PRISM_PUBLIC_CACHE_ENABLED", default=True):
         return PublicCachePolicy(ttl_seconds=0, stale_while_revalidate_seconds=0)
@@ -204,6 +228,14 @@ def public_cache_policy(path: str) -> PublicCachePolicy:
                 86400,
             ),
             immutable=True,
+        )
+    if _is_public_aggregate_path(path):
+        return PublicCachePolicy(
+            ttl_seconds=env_nonnegative_int("PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS", 30),
+            stale_while_revalidate_seconds=env_nonnegative_int(
+                "PRISM_PUBLIC_AGGREGATE_CACHE_STALE_WHILE_REVALIDATE_SECONDS",
+                30,
+            ),
         )
     return PublicCachePolicy(
         ttl_seconds=env_nonnegative_int("PRISM_PUBLIC_CACHE_TTL_SECONDS", 5),
@@ -284,9 +316,31 @@ def dispatch(coordinator: Any, path: str, query: dict[str, list[str]]) -> tuple[
         page, limit = pagination_params(query)
         search = search_param(query)
         window = first_query_value(query, "window") or "3h"
-        if window != "3h":
-            raise PublicApiError(400, "invalid_window", "window must be 3h")
-        return 200, leaderboard(coordinator, page=page, limit=limit, search=search)
+        raw_recipient_id = first_query_value(query, "recipient_id")
+        if window == "3h":
+            if raw_recipient_id is not None:
+                raise PublicApiError(
+                    400,
+                    "invalid_reward_filter",
+                    "recipient_id requires window=reward",
+                )
+            return 200, leaderboard(coordinator, page=page, limit=limit, search=search)
+        if window == "reward":
+            recipient_id = clean_recipient_id(raw_recipient_id) if raw_recipient_id is not None else None
+            if search is not None and recipient_id is not None:
+                raise PublicApiError(
+                    400,
+                    "invalid_reward_filter",
+                    "search and recipient_id are mutually exclusive",
+                )
+            return 200, reward_leaderboard(
+                coordinator,
+                page=page,
+                limit=limit,
+                search=search,
+                recipient_id=recipient_id,
+            )
+        raise PublicApiError(400, "invalid_window", "window must be one of 3h, reward")
     if path == "/public/v1/hashrate-series":
         subject = first_query_value(query, "subject") or "pool"
         range_id = first_query_value(query, "range") or "1m"
@@ -413,6 +467,36 @@ def leaderboard(coordinator: Any, *, page: int, limit: int, search: str | None) 
     }
 
 
+def reward_leaderboard(
+    coordinator: Any,
+    *,
+    page: int,
+    limit: int,
+    search: str | None,
+    recipient_id: str | None,
+) -> dict[str, object]:
+    network = network_summary(coordinator)
+    payload = coordinator.ledger.dashboard_reward_leaderboard(
+        page=page,
+        limit=limit,
+        search=search,
+        recipient_id=recipient_id,
+        current_network_difficulty=network["network_difficulty"],
+    )
+    if Decimal(str(payload["window"]["counted_window_weight"])) != Decimal(
+        str(payload["totals"]["pool_counted_share_difficulty"])
+    ):
+        raise RuntimeError("reward leaderboard counted window weight does not match pool total")
+    return {
+        "schema": "prism.dashboard.leaderboard.v2",
+        "generated_at": payload["window"]["ended_at"],
+        "window": payload["window"],
+        "totals": payload["totals"],
+        "pagination": payload["pagination"],
+        "rows": payload["rows"],
+    }
+
+
 def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: str) -> dict[str, object]:
     if range_id not in {"1w", "1m", "6m", "all"}:
         raise PublicApiError(400, "invalid_range", "range must be one of 1w, 1m, 6m, all")
@@ -429,6 +513,35 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
     else:
         raise PublicApiError(400, "invalid_subject", "subject must be pool or miner:{recipient_id}")
     generated_at = utc_now_iso()
+    bucket_seconds = HASHRATE_SERIES_BUCKET_SECONDS[bucket]
+    window_seconds = public_hashrate_smoothing_seconds()
+    range_seconds = HASHRATE_SERIES_RANGE_SECONDS[range_id]
+    lookback_seconds = 0
+    min_epoch: int | None = None
+    range_anchor_epoch: int | None = None
+    if window_seconds // bucket_seconds >= 2 and range_seconds is not None:
+        # Fetch one full smoothing window of pre-range history so the first
+        # in-range points average over real data instead of artificial zeros,
+        # then trim the context-only points after smoothing. The ledger anchors
+        # its range lower bound on the same epoch min_epoch derives from, so
+        # the trim cannot disagree with the fetch under clock skew.
+        lookback_seconds = (window_seconds // bucket_seconds) * bucket_seconds
+        range_anchor_epoch = int(datetime.now(timezone.utc).timestamp())
+        min_epoch = hashrate_series_min_epoch(range_anchor_epoch, range_seconds, bucket_seconds)
+    points = coordinator.ledger.dashboard_hashrate_series(
+        subject_type=subject_type,
+        subject_id=subject_id,
+        range_id=range_id,
+        bucket=bucket,
+        lookback_seconds=lookback_seconds,
+        range_anchor_epoch=range_anchor_epoch,
+    )
+    points = smooth_hashrate_series_points(
+        points,
+        bucket_seconds=bucket_seconds,
+        window_seconds=window_seconds,
+        min_epoch=min_epoch,
+    )
     return {
         "schema": "prism.dashboard.hashrate-series.v1",
         "generated_at": generated_at,
@@ -436,12 +549,7 @@ def hashrate_series(coordinator: Any, *, subject: str, range_id: str, bucket: st
         "range": range_id,
         "bucket": bucket,
         "unit": "ths",
-        "points": coordinator.ledger.dashboard_hashrate_series(
-            subject_type=subject_type,
-            subject_id=subject_id,
-            range_id=range_id,
-            bucket=bucket,
-        ),
+        "points": points,
     }
 
 
@@ -550,6 +658,21 @@ def public_pool_fee_bps() -> int:
     except (TypeError, ValueError):
         return 0
     return max(0, min(10_000, bps))
+
+
+def public_hashrate_smoothing_seconds() -> int:
+    """Trailing window used to steady hashrate-series points, clamped to [0, 86400].
+
+    0 disables smoothing and returns raw per-bucket rates.
+    """
+    raw = os.environ.get("PRISM_PUBLIC_HASHRATE_SMOOTHING_SECONDS")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_HASHRATE_SMOOTHING_SECONDS
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_HASHRATE_SMOOTHING_SECONDS
+    return max(0, min(86_400, seconds))
 
 
 def latest_block_coinbase_value_bits(coordinator: Any) -> int | None:
@@ -981,10 +1104,6 @@ def network_summary(coordinator: Any) -> dict[str, object]:
         network_info = coordinator.rpc.call("getnetworkinfo")
     except Exception:
         network_info = {}
-    raw_bits = first_present(template.get("bits"), blockchain_info.get("bits"))
-    bits = str(raw_bits if raw_bits is not None else "00000000").lower()
-    if len(bits) != 8 or any(char not in "0123456789abcdef" for char in bits):
-        raise PublicApiError(503, "qbit_rpc_unavailable", "qbit RPC returned invalid compact bits")
     # network_difficulty is reported in PRISM's scaled difficulty units
     # (QBIT_DIFFICULTY_SCALE, see scaled_network_difficulty) so it lines up with the
     # scaled per-share difficulties recorded in the ledger. Every downstream consumer
@@ -995,13 +1114,23 @@ def network_summary(coordinator: Any) -> dict[str, object]:
     # the raw getblockchaininfo.difficulty / getblocktemplate difficulty float, which is
     # ~QBIT_DIFFICULTY_SCALE (1e6) times smaller. Feeding the raw value here made the ETA
     # round to 0 and collapsed the reward window to a single share.
-    if raw_bits is not None:
+    bits = None
+    difficulty = None
+    for raw_bits in (template.get("bits"), blockchain_info.get("bits")):
+        if raw_bits is None:
+            continue
+        candidate = str(raw_bits).lower()
+        if len(candidate) != 8 or any(char not in "0123456789abcdef" for char in candidate):
+            continue
         try:
-            difficulty = scaled_network_difficulty(bits)
-        except ValueError as exc:
-            raise PublicApiError(503, "qbit_rpc_unavailable", "qbit RPC returned invalid compact bits") from exc
-    else:
-        difficulty = 1
+            candidate_difficulty = scaled_network_difficulty(candidate)
+        except ValueError:
+            continue
+        bits = candidate
+        difficulty = candidate_difficulty
+        break
+    if bits is None or difficulty is None:
+        raise PublicApiError(503, "qbit_rpc_unavailable", "qbit RPC did not provide valid compact bits")
     try:
         difficulty_string = decimal_string(difficulty)
     except Exception as exc:
@@ -1054,6 +1183,85 @@ def hashrate_ths_from_difficulty(total_difficulty: int | str | Decimal, seconds:
     if difficulty <= 0:
         return "0"
     return decimal_string(difficulty * HASHES_PER_QBIT_SCALED_DIFFICULTY / Decimal(seconds) / TERAHASH)
+
+
+def hashrate_series_min_epoch(now_epoch: int, range_seconds: int, bucket_seconds: int) -> int:
+    """First bucket epoch whose full span lies inside the bounded range.
+
+    A bucket straddling the range start is trimmed from the response: the
+    lookback-widened ledger query would aggregate pre-range shares into its raw
+    fields (and the unwidened query clipped it short), so neither raw reading
+    describes a fully covered bucket. Its shares still feed the trailing
+    windows of the kept points.
+    """
+    range_start_epoch = now_epoch - range_seconds
+    return -(-range_start_epoch // bucket_seconds) * bucket_seconds
+
+
+def smooth_hashrate_series_points(
+    points: list[dict[str, object]],
+    *,
+    bucket_seconds: int,
+    window_seconds: int,
+    min_epoch: int | None = None,
+) -> list[dict[str, object]]:
+    """Recompute each point's hashrate over a trailing window of buckets.
+
+    Vardiff keeps accepted-share counts per bucket small, so raw 5m bucket rates
+    swing tens of percent point-to-point and the dashboard charts come out
+    choppy. Each point keeps its bucket cadence but its rate is averaged over
+    the trailing window, with buckets missing from the series counting as zero
+    difficulty. accepted_share_count and accepted_share_difficulty stay
+    per-bucket. Windows smaller than two buckets leave the rates unchanged.
+
+    Points before min_epoch are pre-range lookback context: they feed the
+    trailing windows of the first in-range points and are dropped from the
+    result. A point whose timestamp or integer difficulty does not parse is
+    dropped as well -- it can be neither windowed nor range-checked, and
+    dropping it beats leaking pre-range buckets or failing the endpoint over a
+    display refinement. Points are returned ascending by timestamp.
+
+    The trailing total is a rolling int sum (add the entering bucket, evict
+    expired ones), keeping the pass linear in the number of points regardless
+    of the window size and exact regardless of the thread-local Decimal
+    precision.
+    """
+    bucket_count = window_seconds // bucket_seconds if bucket_seconds > 0 else 0
+    if (bucket_count < 2 and min_epoch is None) or not points:
+        return points
+    effective_window_seconds = bucket_count * bucket_seconds
+    parsed_points: list[tuple[int, int, dict[str, object]]] = []
+    for point in points:
+        try:
+            parsed = datetime.strptime(str(point["timestamp"]), "%Y-%m-%dT%H:%M:%SZ")
+            epoch = int(parsed.replace(tzinfo=timezone.utc).timestamp())
+            difficulty = int(str(point["accepted_share_difficulty"]))
+        except (KeyError, ValueError):
+            continue
+        parsed_points.append((epoch, difficulty, point))
+    parsed_points.sort(key=lambda entry: entry[0])
+    smoothed: list[dict[str, object]] = []
+    window: deque[tuple[int, int]] = deque()
+    window_total = 0
+    for epoch, difficulty, point in parsed_points:
+        if bucket_count < 2:
+            if min_epoch is None or epoch >= min_epoch:
+                smoothed.append(point)
+            continue
+        window.append((epoch, difficulty))
+        window_total += difficulty
+        while window and window[0][0] <= epoch - effective_window_seconds:
+            _, expired_difficulty = window.popleft()
+            window_total -= expired_difficulty
+        if min_epoch is not None and epoch < min_epoch:
+            continue
+        smoothed.append(
+            {
+                **point,
+                "hashrate_ths": hashrate_ths_from_difficulty(window_total, effective_window_seconds),
+            }
+        )
+    return smoothed
 
 
 def pagination(page: int, limit: int, total_count: int) -> dict[str, int]:

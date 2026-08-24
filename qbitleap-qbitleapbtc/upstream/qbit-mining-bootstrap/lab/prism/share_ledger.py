@@ -6,18 +6,22 @@ from __future__ import annotations
 import json
 import copy
 import hashlib
+import hmac
 import os
 import math
 import shlex
 import subprocess
 import time
+import traceback
 import uuid
-from dataclasses import dataclass, replace
+from collections.abc import Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from threading import BoundedSemaphore, Lock
-from typing import Any, Callable
+from threading import BoundedSemaphore, Lock, Thread, local
+from typing import Any, Callable, Iterator
 
 from lab.prism.prism_tools import prism_tool_command
 
@@ -28,7 +32,75 @@ AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA = "qbit.prism.window-completeness-proof.v
 DEFAULT_AUDIT_SHARE_SEGMENT_SIZE = 10_000
 DEFAULT_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT = 20
 DEFAULT_CTV_BROADCAST_RETRY_BACKOFF_SECONDS = 300
+DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE = 512
+# Only the coordinator assigns this prefix, and PsqlShareLedger preserves it
+# only after acquiring the writer/epoch advisory guard. Other ledger users and
+# psql-only deployments retain ordinary TTL fencing and are never treated as
+# fast-adoptable merely because they share an identity with a replacement.
+WRITER_LEASE_HEARTBEAT_SESSION_PREFIX = "heartbeat-v1:"
+
+
+class WriterLeaseRenewalDeferred(RuntimeError):
+    """An external side effect was withheld while the lease renewal is deferred.
+
+    The guarded session is live, but its lease TTL renewal is blocked behind
+    this coordinator's own fenced write that has outlasted the TTL. Liveness
+    there assumes the write commits; a rollback would instead hand the
+    expired row to a queued different-identity claimant, so the fence
+    refuses the RPC without fencing the process. Callers retry on their own
+    cadence (broadcast pass interval, block-candidate outbox replay) and
+    succeed once a verification lands a renewal.
+
+    Defined here, with the lease machinery, so side-effect executors like
+    the CTV broadcaster can pass the refusal through to their retrying
+    caller instead of misclassifying it as a failed attempt.
+    """
+
+
+# Statements verify_writer_lease_guard_session may lawfully run inside one
+# guarded slot: the verification statement plus its single attribution
+# recheck. Callers that budget the verification's execution wall-clock must
+# cover this many server-side statement timeouts, or a lawful recheck under
+# moderate database latency is killed by the caller's deadline instead of
+# rescuing the coordinator.
+WRITER_LEASE_VERIFICATION_MAX_STATEMENTS = 2
+DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS = 1.0
 VALID_CREDIT_POLICIES = frozenset({"stale-grace"})
+
+
+class LedgerOperationTimeout(TimeoutError):
+    """A caller-scoped PostgreSQL deadline expired before work completed."""
+
+
+def _is_postgres_deadline_error(error: BaseException | str) -> bool:
+    """Recognize backend cancellations caused by an armed caller deadline."""
+    message = str(error).casefold()
+    sqlstate = getattr(error, "sqlstate", None)
+    if sqlstate is None:
+        sqlstate = getattr(getattr(error, "diag", None), "sqlstate", None)
+    normalized_sqlstate = str(sqlstate or "").upper()
+    if normalized_sqlstate in {"57014", "55P03"}:
+        return True
+    # psql's verbose mode exposes SQLSTATE even when lc_messages localizes the
+    # text. This helper is called only while our statement/lock deadlines are
+    # armed, and ledger SQL does not use NOWAIT, so scoped 55P03 is a timeout.
+    if "57014:" in message or "55p03:" in message:
+        return True
+    return any(
+        marker in message
+        for marker in (
+            "canceling statement due to statement timeout",
+            "canceling statement due to lock timeout",
+            "connection timeout expired",
+            "timeout expired",
+            "connection timed out",
+            "operation timed out",
+        )
+    )
+
+
+class _AuditShareSegmentConflict(RuntimeError):
+    """A share sequence is bound to more than one audit payload."""
 
 
 def validate_credit_policy(credit_policy: str | None) -> str | None:
@@ -54,6 +126,16 @@ class AcceptedShareRecord:
     accepted_at_ms: int
     ntime: int
     credit_policy: str | None = None
+    # Append-result metadata is deliberately excluded from the durable/public
+    # share identity. It lets the coordinator make process-local accounting
+    # idempotent and observe the candidate state from the same transaction
+    # that established the pre-submit outbox boundary.
+    newly_inserted: bool = field(default=True, compare=False, repr=False)
+    candidate_outbox_state: str | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def to_prism_json(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -95,6 +177,323 @@ class PendingShare:
     accepted_at_ms: int
     ntime: int
     credit_policy: str | None = None
+
+
+class IncrementalWindowFallback(RuntimeError):
+    """The cached payout window cannot be advanced from an append-only delta."""
+
+
+@dataclass(frozen=True)
+class IncrementalWindowAdvanceStats:
+    """Bounded work performed while advancing one cached payout window."""
+
+    added_rows: int
+    expired_rows: int
+    touched_pages: int
+
+
+@dataclass(frozen=True)
+class _IncrementalShareWindowPage:
+    records: tuple[AcceptedShareRecord, ...]
+    total_difficulty: int
+    prism_json_records: tuple[dict[str, object], ...]
+    canonical_json_items: bytes
+
+    @classmethod
+    def from_records(
+        cls,
+        records: tuple[AcceptedShareRecord, ...],
+    ) -> _IncrementalShareWindowPage:
+        prism_json_records = tuple(record.to_prism_json() for record in records)
+        return cls(
+            records=records,
+            total_difficulty=sum(int(record.share_difficulty) for record in records),
+            prism_json_records=prism_json_records,
+            canonical_json_items=b",".join(
+                json.dumps(
+                    record,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode()
+                for record in prism_json_records
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class IncrementalShareJsonSequence(Sequence[dict[str, object]]):
+    """Immutable JSON view backed by the payout window's persistent pages.
+
+    Advancing a window allocates JSON only for append/head boundary pages.
+    Iteration remains wire-identical to the historical flat tuple, while the
+    canonical digest streams already-encoded page fragments without calling
+    ``to_prism_json`` on retained shares.
+    """
+
+    pages: tuple[_IncrementalShareWindowPage, ...]
+    record_count: int
+
+    def __len__(self) -> int:
+        return self.record_count
+
+    def __iter__(self) -> Iterator[dict[str, object]]:
+        for page in self.pages:
+            yield from page.prism_json_records
+
+    def __getitem__(
+        self,
+        index: int | slice,
+    ) -> dict[str, object] | tuple[dict[str, object], ...]:
+        if isinstance(index, slice):
+            return tuple(self)[index]
+        resolved = index
+        if resolved < 0:
+            resolved += self.record_count
+        if resolved < 0 or resolved >= self.record_count:
+            raise IndexError(index)
+        for page in self.pages:
+            if resolved < len(page.prism_json_records):
+                return page.prism_json_records[resolved]
+            resolved -= len(page.prism_json_records)
+        raise IndexError(index)
+
+    def canonical_json_sha256(self) -> str:
+        digest = hashlib.sha256()
+        digest.update(b"[")
+        needs_separator = False
+        for page in self.pages:
+            if not page.canonical_json_items:
+                continue
+            if needs_separator:
+                digest.update(b",")
+            digest.update(page.canonical_json_items)
+            needs_separator = True
+        digest.update(b"]")
+        return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class IncrementalShareWindow:
+    """Immutable paged cache of the exact whole-share payout-window superset.
+
+    Pages are stable in ascending ``share_seq`` order. Normal advancement only
+    extends the newest page and expires weight from the oldest pages; retained
+    interior pages are never revisited. The final whole share crossing
+    ``window_weight`` is deliberately retained, matching the Postgres oracle.
+    """
+
+    anchor_job_issued_at_ms: int
+    window_weight: int
+    page_size: int
+    pages: tuple[_IncrementalShareWindowPage, ...]
+    total_difficulty: int
+
+    @classmethod
+    def from_full_snapshot(
+        cls,
+        records: list[AcceptedShareRecord] | tuple[AcceptedShareRecord, ...],
+        *,
+        anchor_job_issued_at_ms: int,
+        window_weight: int,
+        page_size: int = DEFAULT_INCREMENTAL_SHARE_WINDOW_PAGE_SIZE,
+    ) -> IncrementalShareWindow:
+        """Build cache state from the full-rescan oracle.
+
+        Applying the exact crossing-row cutoff here normalizes full-oracle
+        implementations and also provides the authoritative reset after an
+        incremental invariant failure.
+        """
+
+        anchor_job_issued_at_ms = int(anchor_job_issued_at_ms)
+        window_weight = int(window_weight)
+        page_size = int(page_size)
+        if window_weight <= 0:
+            raise ValueError("window_weight must be positive")
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+
+        eligible = sorted(
+            (
+                record
+                for record in records
+                if int(record.job_issued_at_ms) <= anchor_job_issued_at_ms
+                and int(record.accepted_at_ms) <= anchor_job_issued_at_ms
+            ),
+            key=lambda record: int(record.share_seq),
+        )
+        prior_seq: int | None = None
+        share_ids: set[str] = set()
+        for record in eligible:
+            share_seq = int(record.share_seq)
+            if prior_seq is not None and share_seq <= prior_seq:
+                raise ValueError("full payout window contains duplicate share_seq")
+            if record.share_id in share_ids:
+                raise ValueError("full payout window contains duplicate share_id")
+            if int(record.share_difficulty) <= 0:
+                raise ValueError("full payout window contains non-positive difficulty")
+            prior_seq = share_seq
+            share_ids.add(record.share_id)
+
+        start = len(eligible)
+        retained_weight = 0
+        for index in range(len(eligible) - 1, -1, -1):
+            if retained_weight >= window_weight:
+                break
+            retained_weight += int(eligible[index].share_difficulty)
+            start = index
+        retained = tuple(eligible[start:])
+        pages = tuple(
+            _IncrementalShareWindowPage.from_records(
+                retained[offset : offset + page_size]
+            )
+            for offset in range(0, len(retained), page_size)
+        )
+        return cls(
+            anchor_job_issued_at_ms=anchor_job_issued_at_ms,
+            window_weight=window_weight,
+            page_size=page_size,
+            pages=pages,
+            total_difficulty=retained_weight,
+        )
+
+    def records(self) -> tuple[AcceptedShareRecord, ...]:
+        return tuple(record for page in self.pages for record in page.records)
+
+    def json_records(self) -> IncrementalShareJsonSequence:
+        return IncrementalShareJsonSequence(
+            pages=self.pages,
+            record_count=sum(len(page.records) for page in self.pages),
+        )
+
+    def advance(
+        self,
+        delta_records: list[AcceptedShareRecord]
+        | tuple[AcceptedShareRecord, ...],
+        *,
+        anchor_job_issued_at_ms: int,
+    ) -> tuple[IncrementalShareWindow, IncrementalWindowAdvanceStats]:
+        """Fold one newly eligible append delta and expire only the old edge."""
+
+        anchor_job_issued_at_ms = int(anchor_job_issued_at_ms)
+        if anchor_job_issued_at_ms < self.anchor_job_issued_at_ms:
+            raise IncrementalWindowFallback("snapshot anchor moved backwards")
+
+        delta = tuple(delta_records)
+        prior_seq = (
+            int(self.pages[-1].records[-1].share_seq) if self.pages else None
+        )
+        prior_delta_seq: int | None = None
+        for record in delta:
+            share_seq = int(record.share_seq)
+            if int(record.share_difficulty) <= 0:
+                raise IncrementalWindowFallback(
+                    "delta contains non-positive share difficulty"
+                )
+            if (
+                int(record.job_issued_at_ms) > anchor_job_issued_at_ms
+                or int(record.accepted_at_ms) > anchor_job_issued_at_ms
+            ):
+                raise IncrementalWindowFallback(
+                    "delta contains a share ineligible at the new anchor"
+                )
+            if (
+                int(record.job_issued_at_ms) <= self.anchor_job_issued_at_ms
+                and int(record.accepted_at_ms) <= self.anchor_job_issued_at_ms
+            ):
+                raise IncrementalWindowFallback(
+                    "delta repeats a share eligible at the previous anchor"
+                )
+            if prior_seq is not None and share_seq <= prior_seq:
+                raise IncrementalWindowFallback(
+                    "newly eligible share is not an append"
+                )
+            if prior_delta_seq is not None and share_seq <= prior_delta_seq:
+                raise IncrementalWindowFallback("delta share_seq order is not increasing")
+            prior_delta_seq = share_seq
+
+        # Copy page references, never their retained contents. ``touched`` is
+        # intentionally defined as pre-existing retained boundary pages whose
+        # records must be inspected or rewritten; newly allocated append pages
+        # and pages expired wholesale are not part of the retained interior.
+        pages = list(self.pages)
+        touched_existing_pages: set[int] = set()
+        delta_offset = 0
+        if delta and pages and len(pages[-1].records) < self.page_size:
+            available = self.page_size - len(pages[-1].records)
+            appended = delta[:available]
+            if appended:
+                pages[-1] = _IncrementalShareWindowPage.from_records(
+                    pages[-1].records + appended
+                )
+                delta_offset = len(appended)
+                touched_existing_pages.add(len(self.pages) - 1)
+        while delta_offset < len(delta):
+            page_records = delta[delta_offset : delta_offset + self.page_size]
+            pages.append(_IncrementalShareWindowPage.from_records(page_records))
+            delta_offset += len(page_records)
+
+        total_difficulty = self.total_difficulty + sum(
+            int(record.share_difficulty) for record in delta
+        )
+        expired_rows = 0
+        first_retained_page = 0
+        while (
+            first_retained_page < len(pages)
+            and total_difficulty
+            - pages[first_retained_page].total_difficulty
+            >= self.window_weight
+        ):
+            page = pages[first_retained_page]
+            total_difficulty -= page.total_difficulty
+            expired_rows += len(page.records)
+            first_retained_page += 1
+        original_page_offset = first_retained_page
+        if first_retained_page:
+            pages = pages[first_retained_page:]
+
+        if pages:
+            first_page = pages[0]
+            partial_expired = 0
+            while (
+                partial_expired < len(first_page.records)
+                and total_difficulty
+                - int(first_page.records[partial_expired].share_difficulty)
+                >= self.window_weight
+            ):
+                total_difficulty -= int(
+                    first_page.records[partial_expired].share_difficulty
+                )
+                partial_expired += 1
+            if partial_expired:
+                pages[0] = _IncrementalShareWindowPage.from_records(
+                    first_page.records[partial_expired:]
+                )
+                expired_rows += partial_expired
+                if original_page_offset < len(self.pages):
+                    touched_existing_pages.add(original_page_offset)
+
+        advanced = IncrementalShareWindow(
+            anchor_job_issued_at_ms=anchor_job_issued_at_ms,
+            window_weight=self.window_weight,
+            page_size=self.page_size,
+            pages=tuple(pages),
+            total_difficulty=total_difficulty,
+        )
+        return advanced, IncrementalWindowAdvanceStats(
+            added_rows=len(delta),
+            expired_rows=expired_rows,
+            touched_pages=len(touched_existing_pages),
+        )
+
+
+@dataclass(frozen=True)
+class BlockCandidateIntentPersistResult:
+    inserted: bool
+    state: str
+
+    def __bool__(self) -> bool:
+        return self.inserted
 
 
 class SingleWriterShareLedger:
@@ -142,7 +541,7 @@ class SingleWriterShareLedger:
             if pending.share_id in self._share_ids:
                 existing = self._shares_by_id[pending.share_id]
                 if self._pending_matches_record(pending, existing, credit_policy=credit_policy):
-                    return replace(existing)
+                    return replace(existing, newly_inserted=False)
                 raise ValueError("duplicate share_id payload mismatch")
             record = AcceptedShareRecord(
                 share_seq=self._next_share_seq,
@@ -182,7 +581,9 @@ class SingleWriterShareLedger:
             and int(pending.template_height) == int(record.template_height)
             and pending.job_id == record.job_id
             and int(pending.job_issued_at_ms) == int(record.job_issued_at_ms)
-            and int(pending.accepted_at_ms) == int(record.accepted_at_ms)
+            # accepted_at_ms is assigned when the coordinator receives an
+            # attempt. An exact header replay after restart gets a fresh stamp;
+            # the original durable row remains authoritative.
             and int(pending.ntime) == int(record.ntime)
             and credit_policy == record.credit_policy
         )
@@ -235,6 +636,7 @@ class SingleWriterShareLedger:
 
             for pending, candidate in entries:
                 existing = self._shares_by_id.get(pending.share_id)
+                newly_inserted = existing is None
                 if existing is None:
                     credit_policy = validate_credit_policy(pending.credit_policy)
                     existing = AcceptedShareRecord(
@@ -256,7 +658,7 @@ class SingleWriterShareLedger:
                     self._share_ids.add(pending.share_id)
                     self._shares_by_id[pending.share_id] = existing
                     self._next_share_seq += 1
-                records.append(replace(existing))
+                candidate_state: str | None = None
                 if candidate is not None:
                     block_hash = str(candidate["block_hash_hex"]).lower()
                     self._block_candidate_outbox.setdefault(
@@ -269,12 +671,26 @@ class SingleWriterShareLedger:
                             "state": "pending",
                             "attempt_count": 0,
                             "last_error": None,
+                            "created_monotonic": time.monotonic(),
                         },
                     )
                     self._block_candidate_outbox[block_hash]["share_id"] = pending.share_id
+                    candidate_state = str(
+                        self._block_candidate_outbox[block_hash]["state"]
+                    )
+                records.append(
+                    replace(
+                        existing,
+                        newly_inserted=newly_inserted,
+                        candidate_outbox_state=candidate_state,
+                    )
+                )
         return records
 
-    def persist_block_candidate_intent(self, candidate: dict[str, Any]) -> bool:
+    def persist_block_candidate_intent(
+        self,
+        candidate: dict[str, Any],
+    ) -> BlockCandidateIntentPersistResult:
         """Persist candidate work before a below-share-target synchronous submit."""
         block_hash = str(candidate.get("block_hash_hex", "")).lower()
         if not block_hash:
@@ -285,7 +701,10 @@ class SingleWriterShareLedger:
             if existing is not None:
                 if existing["candidate_sha256"] != candidate_sha256:
                     raise ValueError("block candidate payload mismatch")
-                return False
+                return BlockCandidateIntentPersistResult(
+                    inserted=False,
+                    state=str(existing["state"]),
+                )
             self._block_candidate_outbox[block_hash] = {
                 "block_hash": block_hash,
                 "share_id": None,
@@ -294,8 +713,12 @@ class SingleWriterShareLedger:
                 "state": "pending",
                 "attempt_count": 0,
                 "last_error": None,
+                "created_monotonic": time.monotonic(),
             }
-            return True
+            return BlockCandidateIntentPersistResult(
+                inserted=True,
+                state="pending",
+            )
 
     def pending_block_candidates(self, *, limit: int = 32) -> list[dict[str, Any]]:
         return [
@@ -319,6 +742,43 @@ class SingleWriterShareLedger:
                 if row["state"] == "pending"
             ][:limit]
 
+    def block_candidate_pending_metrics(self) -> dict[str, int | float]:
+        """Return bounded pending-candidate age gauges without exposing hashes."""
+        now = time.monotonic()
+        with self._lock:
+            pending = [
+                row
+                for row in self._block_candidate_outbox.values()
+                if row["state"] == "pending"
+            ]
+            unattempted = [
+                row for row in pending if int(row["attempt_count"]) == 0
+            ]
+
+            def oldest_age(rows: list[dict[str, Any]]) -> float:
+                return max(
+                    (
+                        max(0.0, now - float(row.get("created_monotonic", now)))
+                        for row in rows
+                    ),
+                    default=0.0,
+                )
+
+            return {
+                "pending_count": len(pending),
+                "oldest_pending_age_seconds": oldest_age(pending),
+                "oldest_unattempted_age_seconds": oldest_age(unattempted),
+            }
+
+    def mark_block_candidate_attempted(self, *, block_hash: str) -> bool:
+        """Record admission to a real processing phase for one durable row."""
+        with self._lock:
+            row = self._block_candidate_outbox.get(block_hash.lower())
+            if row is None or row["state"] != "pending":
+                return False
+            row["attempt_count"] = int(row["attempt_count"]) + 1
+            return True
+
     def mark_block_candidate_submitted(self, *, block_hash: str) -> bool:
         return self._finish_block_candidate(block_hash=block_hash, state="submitted", error=None)
 
@@ -328,11 +788,10 @@ class SingleWriterShareLedger:
     def _finish_block_candidate(self, *, block_hash: str, state: str, error: str | None) -> bool:
         with self._lock:
             row = self._block_candidate_outbox.get(block_hash.lower())
-            if row is None:
+            if row is None or row["state"] != "pending":
                 return False
             row["state"] = state
             row["last_error"] = error
-            row["attempt_count"] = int(row["attempt_count"]) + 1
             row["candidate"] = None
             return True
 
@@ -342,16 +801,49 @@ class SingleWriterShareLedger:
         *,
         window_weight: int | None = None,
     ) -> list[AcceptedShareRecord]:
-        # window_weight is a bound hint for the large Postgres ledger; the
-        # in-memory ledger is small, so it returns the full eligible set (a
-        # superset of the reward window, which is digest-neutral).
-        del window_weight
         with self._lock:
-            return [
+            eligible = [
                 replace(share)
                 for share in self._shares
                 if share.job_issued_at_ms <= anchor_job_issued_at_ms
                 and share.accepted_at_ms <= anchor_job_issued_at_ms
+            ]
+        if window_weight is None:
+            return eligible
+        # Match the Postgres oracle's exact whole-share crossing rule. This
+        # keeps synchronous and incremental artifacts byte-identical in local
+        # and embedded deployments instead of treating the bound as a hint.
+        return list(
+            IncrementalShareWindow.from_full_snapshot(
+                eligible,
+                anchor_job_issued_at_ms=anchor_job_issued_at_ms,
+                window_weight=int(window_weight),
+            ).records()
+        )
+
+    def snapshot_between_job_issues(
+        self,
+        previous_anchor_job_issued_at_ms: int,
+        anchor_job_issued_at_ms: int,
+    ) -> list[AcceptedShareRecord]:
+        """Return shares becoming eligible between two inclusive anchors."""
+
+        previous_anchor = int(previous_anchor_job_issued_at_ms)
+        anchor = int(anchor_job_issued_at_ms)
+        if anchor < previous_anchor:
+            raise ValueError("snapshot anchor moved backwards")
+        if anchor == previous_anchor:
+            return []
+        with self._lock:
+            return [
+                replace(share)
+                for share in self._shares
+                if share.job_issued_at_ms <= anchor
+                and share.accepted_at_ms <= anchor
+                and (
+                    share.job_issued_at_ms > previous_anchor
+                    or share.accepted_at_ms > previous_anchor
+                )
             ]
 
     def all_shares(self) -> list[AcceptedShareRecord]:
@@ -380,6 +872,8 @@ class SingleWriterShareLedger:
             "audit_row_count": 0,
             "audit_head_sha256": "00" * 32,
             "mismatch_count": 0,
+            "current_drift_count": 0,
+            "current_drift": [],
             "mismatches": [],
         }
 
@@ -771,6 +1265,135 @@ class SingleWriterShareLedger:
             "rows": rows[offset : offset + limit],
         }
 
+    def dashboard_reward_leaderboard(
+        self,
+        *,
+        page: int,
+        limit: int,
+        current_network_difficulty: int | str | Decimal,
+        search: str | None = None,
+        recipient_id: str | None = None,
+    ) -> dict[str, object]:
+        from lab.prism import public_api
+
+        if search is not None and recipient_id is not None:
+            raise ValueError("search and recipient_id are mutually exclusive")
+        now = datetime.now(timezone.utc)
+        anchor_ms = int(now.timestamp() * 1000)
+        requested_window_weight = _reward_window_weight(current_network_difficulty)
+        window_shares = _prism_window_shares(
+            self.all_shares(),
+            anchor_job_issued_at_ms=anchor_ms,
+            requested_window_weight=requested_window_weight,
+        )
+        counted_window_weight = sum(
+            (row.counted_difficulty for row in window_shares),
+            Decimal(0),
+        )
+        oldest_ms = min((row.share.accepted_at_ms for row in window_shares), default=None)
+        observed_span_seconds = None
+        if oldest_ms is not None:
+            observed_span_seconds = max(0, (anchor_ms - oldest_ms) // 1000)
+
+        by_miner: dict[str, dict[str, object]] = {}
+        for window_share in window_shares:
+            share = window_share.share
+            row = by_miner.setdefault(
+                share.miner_id,
+                {
+                    "recipient_id": share.miner_id,
+                    "included_share_count": 0,
+                    "counted_share_difficulty": Decimal(0),
+                    "last_share_at_ms": share.accepted_at_ms,
+                },
+            )
+            row["included_share_count"] = int(row["included_share_count"]) + 1
+            row["counted_share_difficulty"] = Decimal(row["counted_share_difficulty"]) + window_share.counted_difficulty
+            row["last_share_at_ms"] = max(int(row["last_share_at_ms"]), share.accepted_at_ms)
+
+        ranked = sorted(
+            by_miner.values(),
+            key=lambda row: (-Decimal(row["counted_share_difficulty"]), str(row["recipient_id"])),
+        )
+        rows: list[dict[str, object]] = []
+        for index, row in enumerate(ranked, start=1):
+            counted_share_difficulty = Decimal(row["counted_share_difficulty"])
+            share_percent = None
+            if counted_window_weight > 0:
+                share_percent = public_api.decimal_string(
+                    counted_share_difficulty * Decimal(100) / counted_window_weight
+                )
+            hashrate_ths = None
+            if observed_span_seconds is not None and observed_span_seconds > 0:
+                hashrate_ths = public_api.hashrate_ths_from_difficulty(
+                    counted_share_difficulty,
+                    observed_span_seconds,
+                )
+            rows.append(
+                {
+                    "rank": index,
+                    "recipient_id": row["recipient_id"],
+                    "display_name": None,
+                    "hashrate_ths": hashrate_ths,
+                    "included_share_count": int(row["included_share_count"]),
+                    "counted_share_difficulty": public_api.decimal_string(counted_share_difficulty),
+                    "share_percent": share_percent,
+                    "blocks_found_total": 0,
+                    "last_share_at": _iso_from_ms(int(row["last_share_at_ms"])),
+                }
+            )
+
+        filtered_rows = rows
+        if recipient_id is not None:
+            filtered_rows = [
+                row
+                for row in rows
+                if row["recipient_id"] == recipient_id
+            ]
+        elif search:
+            normalized_search = search.lower()
+            filtered_rows = [
+                row
+                for row in rows
+                if normalized_search in str(row["recipient_id"]).lower()
+            ]
+        offset = (page - 1) * limit
+
+        pool_hashrate_ths = None
+        expected_time_to_block = None
+        if observed_span_seconds is not None and observed_span_seconds > 0 and counted_window_weight > 0:
+            pool_hashrate_ths = public_api.hashrate_ths_from_difficulty(
+                counted_window_weight,
+                observed_span_seconds,
+            )
+            expected_time_to_block = public_api.expected_time_to_block_seconds(
+                hashrate_ths=pool_hashrate_ths,
+                network_difficulty=public_api.decimal_string(current_network_difficulty),
+            )
+
+        return {
+            "window": {
+                "id": "reward",
+                "started_at": _iso_from_ms(oldest_ms),
+                "ended_at": public_api.iso_datetime(now),
+                "observed_span_seconds": observed_span_seconds,
+                "network_difficulty": public_api.decimal_string(current_network_difficulty),
+                "window_multiplier": 8,
+                "requested_window_weight": public_api.decimal_string(requested_window_weight),
+                "counted_window_weight": public_api.decimal_string(counted_window_weight),
+                "included_share_count": len(window_shares),
+                "is_complete": requested_window_weight > 0 and counted_window_weight >= requested_window_weight,
+            },
+            "totals": {
+                "pool_hashrate_ths": pool_hashrate_ths,
+                "pool_counted_share_difficulty": public_api.decimal_string(counted_window_weight),
+                "participant_count": len(ranked),
+                "expected_time_to_block_seconds": expected_time_to_block,
+            },
+            "pagination": public_api.pagination(page, limit, len(filtered_rows)),
+            "rows": filtered_rows[offset : offset + limit],
+        }
+
     def dashboard_hashrate_series(
         self,
         *,
@@ -778,11 +1401,24 @@ class SingleWriterShareLedger:
         subject_id: str | None,
         range_id: str,
         bucket: str,
+        lookback_seconds: int = 0,
+        range_anchor_epoch: int | None = None,
     ) -> list[dict[str, object]]:
         from lab.prism import public_api
 
         now = datetime.now(timezone.utc)
-        started = _series_start(now, range_id)
+        # Anchor the range lower bound on the caller's clock when provided so
+        # it agrees with the caller's min_epoch trim regardless of clock skew.
+        anchor = (
+            datetime.fromtimestamp(range_anchor_epoch, timezone.utc)
+            if range_anchor_epoch is not None
+            else now
+        )
+        started = _series_start(anchor, range_id)
+        if lookback_seconds > 0 and range_id != "all":
+            # Pre-range context requested by the smoother; the caller trims
+            # these buckets from the response after windowing.
+            started -= timedelta(seconds=int(lookback_seconds))
         bucket_seconds = {"5m": 300, "1h": 3600, "1d": 86400}[bucket]
         buckets: dict[int, dict[str, int]] = {}
         for share in self.all_shares():
@@ -813,6 +1449,7 @@ class SingleWriterShareLedger:
         parent_hash: str,
         final_bundle: dict[str, Any],
         audit_report: dict[str, Any],
+        canonical_bundle_path: Path | None = None,
     ) -> dict[str, int | str]:
         return {
             "backend": "memory",
@@ -962,6 +1599,316 @@ def _series_start(now: datetime, range_id: str) -> datetime:
     return datetime.fromtimestamp(0, timezone.utc)
 
 
+def database_url_from_psql_command(command: list[str]) -> str | None:
+    """Best-effort DSN extraction from a psql invocation.
+
+    Handles the common shapes the coordinator and deploy tooling produce:
+    ``psql postgres://...``, ``psql -d postgres://...`` and
+    ``psql --dbname=postgres://...``. Anything else (host/user flags, service
+    files) stays on the subprocess backend rather than risking a mistranslated
+    connection.
+    """
+    expect_dbname = False
+    for arg in command[1:]:
+        if expect_dbname:
+            candidate = arg
+            expect_dbname = False
+        elif arg in {"-d", "--dbname"}:
+            expect_dbname = True
+            continue
+        elif arg.startswith("--dbname="):
+            candidate = arg.split("=", 1)[1]
+        else:
+            candidate = arg
+        if candidate.startswith("postgres://") or candidate.startswith("postgresql://"):
+            return candidate
+    return None
+
+
+def _writer_lease_advisory_lock_key(writer_id: str, writer_epoch: int) -> int:
+    """Return a stable signed bigint key namespaced to the PRISM writer lease."""
+    digest = hashlib.sha256(
+        b"qbit-prism-writer-lease\0"
+        + writer_id.encode("utf-8")
+        + b"\0"
+        + str(writer_epoch).encode("ascii")
+    ).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
+class _NativePostgresClient:
+    """Persistent pooled psycopg client for the share ledger.
+
+    Executes the exact same self-contained SQL text the psql subprocess
+    backend runs (values are inlined by the callers), but over long-lived
+    connections instead of one fork+connect per statement. Every statement
+    returns a single JSON value, mirroring the psql `--tuples-only` contract.
+    Connections are created lazily, run in autocommit (each statement is its
+    own synchronous commit, exactly like a psql invocation — including the
+    group-commit ``append_batch`` statement, whose durability comes from its
+    own ``set_config('synchronous_commit', 'on', true)``), and a connection
+    that raises is discarded so the next acquisition reconnects.
+
+    ``application_name`` (overriding any value in the conninfo) marks every
+    pooled backend in ``pg_stat_activity`` as belonging to this process, so
+    the lease guard can attribute an in-flight lease-tuple lock to the
+    writer's own fenced transaction rather than a competing expiry claim
+    (see ``verify_writer_lease_guard_session``).
+    """
+
+    def __init__(
+        self,
+        conninfo: str,
+        *,
+        pool_size: int,
+        application_name: str | None = None,
+    ):
+        import psycopg  # deferred: the subprocess backend must work without it
+
+        self._psycopg = psycopg
+        self._conninfo = conninfo
+        self._application_name = application_name
+        self._pool_size = max(1, int(pool_size))
+        self._slots = BoundedSemaphore(self._pool_size)
+        self._idle: list[Any] = []
+        self._idle_lock = Lock()
+        self._closed = False
+
+    @property
+    def pool_size(self) -> int:
+        return self._pool_size
+
+    def _connect(self, timeout_seconds: float | None = None) -> Any:
+        kwargs: dict[str, Any] = {"autocommit": True}
+        if timeout_seconds is not None:
+            # libpq accepts integral connect_timeout seconds. Rounding up keeps
+            # sub-second statement budgets valid without silently disabling
+            # the connection deadline.
+            kwargs["connect_timeout"] = max(1, math.ceil(timeout_seconds))
+        if self._application_name is not None:
+            kwargs["application_name"] = self._application_name
+        return self._psycopg.connect(self._conninfo, **kwargs)
+
+    @contextmanager
+    def connection(self, *, timeout_seconds: float | None = None) -> Iterator[Any]:
+        """Borrow a pooled connection; discard it if the caller raises."""
+        started = time.monotonic()
+        if timeout_seconds is None:
+            acquired = self._slots.acquire()
+        else:
+            acquired = self._slots.acquire(timeout=max(0.0, timeout_seconds))
+        if not acquired:
+            raise LedgerOperationTimeout("timed out waiting for a postgres pool slot")
+        conn = None
+        try:
+            with self._idle_lock:
+                if self._closed:
+                    raise RuntimeError("postgres client is closed")
+                if self._idle:
+                    conn = self._idle.pop()
+            if conn is None or conn.closed:
+                connect_timeout = timeout_seconds
+                if connect_timeout is not None:
+                    connect_timeout = max(
+                        0.001,
+                        connect_timeout - (time.monotonic() - started),
+                    )
+                conn = self._connect(connect_timeout)
+            yield conn
+        except BaseException:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            raise
+        else:
+            with self._idle_lock:
+                if self._closed:
+                    keep = False
+                else:
+                    self._idle.append(conn)
+                    keep = True
+            if not keep:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        finally:
+            self._slots.release()
+
+    def run_json(
+        self,
+        sql: str,
+        *,
+        retry_safe: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> Any:
+        """Run one JSON-returning statement.
+
+        An ``OperationalError`` does not reveal whether PostgreSQL committed
+        before the response was lost. Retry once only when the caller has
+        explicitly classified the statement as safe to execute again; every
+        mutation fails after the first ambiguous execution.
+        """
+        attempts = 2 if retry_safe else 1
+        deadline = (
+            None
+            if timeout_seconds is None
+            else time.monotonic() + max(0.0, timeout_seconds)
+        )
+        for attempt in range(attempts):
+            try:
+                remaining = (
+                    None
+                    if deadline is None
+                    else max(0.0, deadline - time.monotonic())
+                )
+                if remaining is not None and remaining <= 0:
+                    raise LedgerOperationTimeout("postgres statement deadline expired")
+                connection = (
+                    self.connection()
+                    if remaining is None
+                    else self.connection(timeout_seconds=remaining)
+                )
+                with connection as conn:
+                    if deadline is None:
+                        row = conn.execute(sql).fetchone()
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise LedgerOperationTimeout(
+                                "postgres statement deadline expired"
+                            )
+                        timeout_ms = max(1, int(remaining * 1000))
+                        # SET LOCAL confines both guards to this explicit
+                        # transaction, so pooled connections cannot leak a
+                        # submitter-specific deadline into unrelated work.
+                        with conn.transaction():
+                            conn.execute(
+                                f"SET LOCAL statement_timeout = '{timeout_ms}ms'"
+                            )
+                            conn.execute(
+                                f"SET LOCAL lock_timeout = '{timeout_ms}ms'"
+                            )
+                            row = conn.execute(sql).fetchone()
+                return parse_single_json_value(row[0] if row else None)
+            except self._psycopg.OperationalError as exc:
+                if timeout_seconds is not None and _is_postgres_deadline_error(exc):
+                    raise LedgerOperationTimeout(
+                        f"postgres operation exceeded {timeout_seconds:g}s"
+                    ) from exc
+                if attempt + 1 >= attempts:
+                    raise RuntimeError(f"postgres query failed: {exc}") from exc
+        raise AssertionError("unreachable")
+
+    def run_script(self, sql: str) -> None:
+        """Run a multi-statement script (schema initialization)."""
+        with self.connection() as conn:
+            conn.execute(sql)
+
+    def close(self) -> None:
+        with self._idle_lock:
+            self._closed = True
+            idle, self._idle = self._idle, []
+        for conn in idle:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+class _NativePostgresLeaseGuard:
+    """Hold one writer identity's PostgreSQL session advisory lock.
+
+    Unlike the ordinary native pool, this connection is never transparently
+    replaced: losing it also loses the advisory lock and must fence the owning
+    coordinator. The lease heartbeat runs on this same isolated session.
+    """
+
+    def __init__(self, conninfo: str, advisory_lock_key: int):
+        import psycopg  # deferred: psql-only users retain TTL fencing
+
+        self._connection = psycopg.connect(
+            conninfo,
+            autocommit=True,
+            connect_timeout=2,
+            options="-c statement_timeout=500",
+        )
+        self._advisory_lock_key = advisory_lock_key
+        self._query_lock = Lock()
+        self._closed = False
+        self._held = False
+
+    def try_acquire(self) -> bool:
+        row = self._connection.execute(
+            f"SELECT pg_try_advisory_lock({self._advisory_lock_key})"
+        ).fetchone()
+        self._held = bool(row and row[0])
+        return self._held
+
+    @property
+    def held(self) -> bool:
+        return self._held and not self._closed and not self._connection.closed
+
+    def run_json(
+        self,
+        sql: str,
+        *,
+        on_query_start: Callable[[], None] | None = None,
+        followup: Callable[[Any], str | None] | None = None,
+    ) -> Any:
+        with self._query_lock:
+            # Queries on this session serialize behind the periodic heartbeat
+            # and any concurrent caller. The callback marks the moment the
+            # serialized slot is acquired, so callers can budget queue wait
+            # and statement execution separately.
+            if on_query_start is not None:
+                on_query_start()
+            if not self.held:
+                raise RuntimeError("postgres writer lease guard is not held")
+            row = self._connection.execute(sql).fetchone()
+            result = parse_single_json_value(row[0] if row else None)
+            # A followup runs inside this same serialized slot: no second
+            # queue wait behind other guard callers can be charged to the
+            # caller's execution budget. Each execute on this autocommit
+            # session is still its own statement with a fresh snapshot,
+            # which is exactly what verification rechecks need. The
+            # callback owns termination by returning None.
+            while followup is not None:
+                next_sql = followup(result)
+                if next_sql is None:
+                    break
+                row = self._connection.execute(next_sql).fetchone()
+                result = parse_single_json_value(row[0] if row else None)
+            return result
+
+    def close(self) -> None:
+        """Close the session, releasing its advisory lock server-side."""
+        if self._closed:
+            return
+        self._closed = True
+        self._held = False
+        try:
+            self._connection.close()
+        except Exception:
+            pass
+
+
+def parse_single_json_value(value: object) -> Any:
+    """Normalize a one-row/one-column JSON query result.
+
+    psycopg already decodes json/jsonb columns to Python objects; the psql
+    subprocess path yields text. A NULL result matches the subprocess
+    behavior of raising on empty output.
+    """
+    if value is None:
+        raise RuntimeError("postgres query returned no JSON")
+    if isinstance(value, (str, bytes, bytearray)):
+        return json.loads(value)
+    return value
+
+
 class PsqlShareLedger:
     """Postgres-backed implementation of the coordinator share-ledger API.
 
@@ -970,10 +1917,59 @@ class PsqlShareLedger:
     SQL schema under `crates/qbit-prism/sql`.
     """
 
+    durable_payout_state = True
+
+    @staticmethod
+    def _resolve_lease_authority_margin_seconds(
+        lease_ttl_seconds: float,
+        lease_authority_margin_seconds: float | None,
+    ) -> float:
+        """Resolve the own-write deferral margin for external side effects.
+
+        Never below half the lease TTL: that floor keeps the deferral
+        engaged through the eroded tail of a long own fenced write even
+        when the configured guarded-RPC deadlines are short. A caller
+        supplies a larger margin when its longest fence-guarded RPC could
+        outlast the floor — the margin must cover the longest effect the
+        fence can authorize, or the effect outlives its runway and
+        degenerates into rollback-dependent authority.
+
+        A margin that reaches the TTL is rejected outright rather than
+        accepted as defer-every-skip: the deferral only gates renewal
+        *skips*, while a verification over an uncontended row renews and
+        authorizes unconditionally — and a landed renewal's runway is
+        exactly one TTL. When the guarded effect's deadline can reach the
+        TTL, even a freshly renewed lease cannot outlast the effect, so
+        no deferral policy closes the authorize-then-expire window and
+        the configuration itself is unsafe. Failing construction turns a
+        silent split-brain hazard into a startup error: raise the lease
+        TTL or lower the guarded RPC deadlines.
+        """
+        floor = lease_ttl_seconds / 2.0
+        if lease_authority_margin_seconds is None:
+            return floor
+        margin = float(lease_authority_margin_seconds)
+        if not math.isfinite(margin) or margin < 0:
+            raise ValueError(
+                "lease_authority_margin_seconds must be finite and non-negative"
+            )
+        if margin >= lease_ttl_seconds:
+            raise ValueError(
+                "lease_authority_margin_seconds "
+                f"({margin}) must stay below lease_ttl_seconds "
+                f"({lease_ttl_seconds}): a fence-guarded RPC whose deadline "
+                "can reach the lease TTL can outlive even a freshly renewed "
+                "lease, and renewals bypass the own-write deferral entirely; "
+                "raise the lease TTL or lower the guarded RPC deadlines"
+            )
+        return max(floor, margin)
+
     def __init__(
         self,
         *,
         psql_command: str,
+        database_url: str | None = None,
+        native_client_mode: str = "auto",
         writer_id: str = "prism-coordinator",
         writer_epoch: int = 1,
         writer_session_token: str | None = None,
@@ -982,7 +1978,11 @@ class PsqlShareLedger:
         lease_retry_sleep: Callable[[float], None] | None = None,
         lease_retry_max_sleep_seconds: float = 15.0,
         lease_ttl_seconds: float = 60.0,
+        lease_authority_margin_seconds: float | None = None,
+        lease_adoption_silence_seconds: float = DEFAULT_WRITER_LEASE_ADOPTION_SILENCE_SECONDS,
         read_concurrency: int = 4,
+        accepted_stats_cache_seconds: float = 60.0,
+        reward_window_cache_seconds: float = 30.0,
         audit_body_dir: str | Path | None = None,
         audit_bundle_canonicalizer: Callable[[dict[str, Any]], bytes] | None = None,
         audit_share_segment_size: int = 0,
@@ -991,12 +1991,30 @@ class PsqlShareLedger:
     ):
         if writer_epoch < 0:
             raise ValueError("writer_epoch must be >= 0")
+        accepted_stats_cache_seconds = float(accepted_stats_cache_seconds)
+        if not math.isfinite(accepted_stats_cache_seconds) or accepted_stats_cache_seconds < 0:
+            raise ValueError("accepted_stats_cache_seconds must be finite and non-negative")
+        reward_window_cache_seconds = float(reward_window_cache_seconds)
+        if not math.isfinite(reward_window_cache_seconds) or reward_window_cache_seconds < 0:
+            raise ValueError("reward_window_cache_seconds must be finite and non-negative")
         lease_retry_max_sleep_seconds = float(lease_retry_max_sleep_seconds)
         if lease_retry_max_sleep_seconds <= 0:
             raise ValueError("lease_retry_max_sleep_seconds must be positive")
         lease_ttl_seconds = float(lease_ttl_seconds)
         if not math.isfinite(lease_ttl_seconds) or lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be finite and positive")
+        lease_authority_margin_seconds = (
+            self._resolve_lease_authority_margin_seconds(
+                lease_ttl_seconds,
+                lease_authority_margin_seconds,
+            )
+        )
+        lease_adoption_silence_seconds = float(lease_adoption_silence_seconds)
+        if (
+            not math.isfinite(lease_adoption_silence_seconds)
+            or lease_adoption_silence_seconds <= 0
+        ):
+            raise ValueError("lease_adoption_silence_seconds must be finite and positive")
         read_concurrency = int(read_concurrency)
         if read_concurrency <= 0:
             raise ValueError("read_concurrency must be positive")
@@ -1006,6 +2024,13 @@ class PsqlShareLedger:
         self._writer_id = writer_id
         self._writer_epoch = writer_epoch
         self._writer_session_token = writer_session_token or uuid.uuid4().hex
+        # Advertised as application_name by every pooled connection so the
+        # lease guard can recognize the lease tuple's locker as one of this
+        # process's own backends (a fenced write outlasting the TTL) rather
+        # than a competing expiry claim. Unique per ledger instance: a
+        # predecessor or replacement process never shares it, so their
+        # in-flight writes still fence this session out.
+        self._pool_application_name = f"qbit-prism-writer-{uuid.uuid4().hex}"
         self._lease_ttl_seconds = lease_ttl_seconds
         # SQL fragment for the writer-lease expiry. The lease is refreshed on
         # every append (the dominant liveness signal during active mining), so a
@@ -1013,9 +2038,20 @@ class PsqlShareLedger:
         # after an *ungraceful* crash. Graceful shutdown releases the lease
         # outright (see release_writer_lease), making restarts near-instant.
         self._lease_interval_sql = f"make_interval(secs => {lease_ttl_seconds})"
+        self._lease_authority_margin_seconds = lease_authority_margin_seconds
+        # SQL fragment for the own-write deferral margin (see
+        # verify_writer_lease_guard_session): an own-write renewal skip over
+        # a committed row with less than this much TTL remaining defers
+        # external side effects instead of authorizing them.
+        self._lease_authority_margin_sql = (
+            f"make_interval(secs => {lease_authority_margin_seconds})"
+        )
         self._lease_retry_sleep = lease_retry_sleep or time.sleep
         self._lease_retry_max_sleep_seconds = lease_retry_max_sleep_seconds
         self._lease_retry_min_sleep_seconds = min(0.25, self._lease_retry_max_sleep_seconds)
+        self._lease_adoption_silence_seconds = lease_adoption_silence_seconds
+        self._operation_timeout_local = local()
+        self._statement_timeout_local = local()
         self._lock = Lock()
         self._read_semaphore = BoundedSemaphore(read_concurrency)
         self._audit_body_dir = Path(audit_body_dir) if audit_body_dir else None
@@ -1032,14 +2068,288 @@ class PsqlShareLedger:
         if ctv_broadcast_retry_backoff_seconds < 0:
             raise ValueError("ctv_broadcast_retry_backoff_seconds must be non-negative")
         self._ctv_broadcast_retry_backoff_seconds = ctv_broadcast_retry_backoff_seconds
-        if initialize_schema:
-            path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
-            self._run_sql(path.read_text(encoding="utf-8"))
-        self._ensure_writer_lease()
+        self._accepted_stats_cache_seconds = accepted_stats_cache_seconds
+        self._reward_window_cache_seconds = reward_window_cache_seconds
+        self._reward_window_cache_lock = Lock()
+        self._reward_window_cache: tuple[str, float, dict[str, Any]] | None = None
+        self._stats_lock = Lock()
+        self._stats_refresh_lock = Lock()
+        self._stats_counts: dict[str, int] | None = None
+        self._stats_max_share_seq = 0
+        self._stats_note_buffer: dict[int, bool] | None = None
+        self._stats_refreshed_monotonic: float | None = None
+        self._stats_background_refresh_thread: Thread | None = None
+        self._stats_reconcile_failures = 0
+        self._prior_balances_read_stats_lock = Lock()
+        self._prior_balances_reads_total = 0
+        self._prior_balances_read_last_seconds = 0.0
+        self._prior_balances_read_max_seconds = 0.0
+        self._native = self._make_native_client(
+            native_client_mode,
+            database_url,
+            read_concurrency=read_concurrency,
+        )
+        self._writer_lease_guard: _NativePostgresLeaseGuard | None = None
+        try:
+            self._initialize_writer_lease_guard(database_url)
+            if initialize_schema:
+                path = schema_path or Path(__file__).resolve().parents[2] / "crates/qbit-prism/sql/001_share_ledger.sql"
+                self._run_script(path.read_text(encoding="utf-8"))
+            self._ensure_writer_lease()
+        except BaseException:
+            self.close()
+            raise
+
+    def _make_native_client(
+        self,
+        native_client_mode: str,
+        database_url: str | None,
+        *,
+        read_concurrency: int,
+    ) -> _NativePostgresClient | None:
+        mode = (native_client_mode or "auto").strip().lower()
+        if mode in {"0", "false", "no", "off", "psql"}:
+            return None
+        if mode not in {"auto", "1", "true", "yes", "on", "native"}:
+            raise ValueError(f"unsupported native client mode: {native_client_mode!r}")
+        required = mode != "auto"
+        conninfo = database_url or database_url_from_psql_command(self._command)
+        if conninfo is None:
+            if required:
+                raise ValueError(
+                    "PRISM_POSTGRES_NATIVE_CLIENT=1 requires PRISM_DATABASE_URL or a "
+                    "postgres:// DSN inside PRISM_POSTGRES_PSQL_COMMAND"
+                )
+            return None
+        try:
+            # One pooled connection per concurrent reader plus one for the
+            # serialized write path (the coordinator's share writer thread).
+            return _NativePostgresClient(
+                conninfo,
+                pool_size=read_concurrency + 1,
+                application_name=self._pool_application_name,
+            )
+        except ImportError:
+            if required:
+                raise ValueError(
+                    "PRISM_POSTGRES_NATIVE_CLIENT=1 requires the psycopg package"
+                ) from None
+            # Silent fallback: which execution backend is active is reported
+            # by the owning daemon's startup line via execution_backend.
+            return None
+
+    def _make_writer_lease_guard(
+        self,
+        database_url: str | None,
+    ) -> _NativePostgresLeaseGuard | None:
+        if self._native is None:
+            return None
+        conninfo = database_url or database_url_from_psql_command(self._command)
+        if conninfo is None:
+            return None
+        return _NativePostgresLeaseGuard(
+            conninfo,
+            _writer_lease_advisory_lock_key(self._writer_id, self._writer_epoch),
+        )
+
+    def _initialize_writer_lease_guard(self, database_url: str | None) -> None:
+        if not self._writer_session_token.startswith(
+            WRITER_LEASE_HEARTBEAT_SESSION_PREFIX
+        ):
+            return
+        warned = False
+        while True:
+            guard = self._make_writer_lease_guard(database_url)
+            if guard is None:
+                # A psql subprocess cannot retain a session advisory lock.
+                # Downgrade before publishing the token so other processes
+                # conservatively retain TTL fencing for this owner.
+                self._writer_session_token = uuid.uuid4().hex
+                print(
+                    "prism ledger writer fast adoption disabled: persistent "
+                    "native PostgreSQL connection unavailable; using TTL fencing",
+                    flush=True,
+                )
+                return
+            try:
+                acquired = guard.try_acquire()
+            except Exception:
+                guard.close()
+                raise
+            if acquired:
+                self._writer_lease_guard = guard
+                # Adoption silence is measured from this moment as well as
+                # from the lease row's updated_at. The predecessor that just
+                # lost this advisory lock self-fences within its heartbeat
+                # failure budget; counting from acquisition guarantees it
+                # that time even when its lease row is already stale because
+                # a long fenced transaction withheld updated_at refreshes.
+                self._writer_lease_guard_acquired_monotonic = time.monotonic()
+                return
+            guard.close()
+            if not warned:
+                print(
+                    "prism ledger writer guard held by a live same-identity "
+                    "coordinator; waiting before lease acquisition",
+                    flush=True,
+                )
+                warned = True
+            self._lease_retry_sleep(self._lease_retry_min_sleep_seconds)
+
+    @property
+    def execution_backend(self) -> str:
+        if getattr(self, "_native", None) is not None:
+            return "psycopg-pool"
+        return "psql-subprocess"
+
+    def close(self) -> None:
+        """Release pooled native connections. Safe to call multiple times."""
+        native = getattr(self, "_native", None)
+        if native is not None:
+            native.close()
+        self._close_writer_lease_guard()
+
+    def _close_writer_lease_guard(self) -> None:
+        guard = getattr(self, "_writer_lease_guard", None)
+        if guard is None:
+            return
+        self._writer_lease_guard = None
+        guard.close()
+
+    @property
+    def writer_lease_fast_adoption_capable(self) -> bool:
+        guard = getattr(self, "_writer_lease_guard", None)
+        return bool(
+            self._writer_session_token.startswith(
+                WRITER_LEASE_HEARTBEAT_SESSION_PREFIX
+            )
+            and guard is not None
+            and guard.held
+        )
+
+    @property
+    def writer_lease_guard_required(self) -> bool:
+        return self._writer_session_token.startswith(
+            WRITER_LEASE_HEARTBEAT_SESSION_PREFIX
+        )
+
+    @property
+    def writer_lease_last_refresh_monotonic(self) -> float | None:
+        return getattr(self, "_writer_lease_last_refresh_monotonic", None)
 
     @property
     def backend_name(self) -> str:
         return "postgres-psql"
+
+    @contextmanager
+    def operation_timeout(self, timeout_seconds: float) -> Iterator[None]:
+        """Bound PostgreSQL and local admission for the current thread.
+
+        The block submitter uses this scope for direct outbox operations.
+        Nested scopes keep the earliest deadline, so helper calls cannot
+        accidentally widen the caller's liveness budget.
+        """
+        timeout_seconds = float(timeout_seconds)
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("operation timeout must be finite and positive")
+        timeout_local = getattr(self, "_operation_timeout_local", None)
+        if timeout_local is None:
+            timeout_local = local()
+            self._operation_timeout_local = timeout_local
+        previous = getattr(timeout_local, "deadline", None)
+        deadline = time.monotonic() + timeout_seconds
+        timeout_local.deadline = (
+            deadline if previous is None else min(float(previous), deadline)
+        )
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del timeout_local.deadline
+                except AttributeError:
+                    pass
+            else:
+                timeout_local.deadline = previous
+
+    @contextmanager
+    def statement_timeout(self, timeout_seconds: float) -> Iterator[None]:
+        """Apply a fresh bound to each lock admission and SQL statement.
+
+        Unlike ``operation_timeout``, this budget does not start counting down
+        across non-database work between calls. The block accounting tail can
+        therefore build and verify an audit bundle before giving each later
+        Postgres step its own short deadline.
+        """
+        timeout_seconds = float(timeout_seconds)
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("statement timeout must be finite and positive")
+        timeout_local = getattr(self, "_statement_timeout_local", None)
+        if timeout_local is None:
+            timeout_local = local()
+            self._statement_timeout_local = timeout_local
+        previous = getattr(timeout_local, "timeout_seconds", None)
+        timeout_local.timeout_seconds = (
+            timeout_seconds
+            if previous is None
+            else min(float(previous), timeout_seconds)
+        )
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del timeout_local.timeout_seconds
+                except AttributeError:
+                    pass
+            else:
+                timeout_local.timeout_seconds = previous
+
+    def _remaining_operation_timeout(self) -> float | None:
+        timeout_local = getattr(self, "_operation_timeout_local", None)
+        deadline = (
+            getattr(timeout_local, "deadline", None)
+            if timeout_local is not None
+            else None
+        )
+        statement_timeout_local = getattr(
+            self,
+            "_statement_timeout_local",
+            None,
+        )
+        statement_timeout_seconds = (
+            getattr(statement_timeout_local, "timeout_seconds", None)
+            if statement_timeout_local is not None
+            else None
+        )
+        if deadline is None:
+            return (
+                None
+                if statement_timeout_seconds is None
+                else float(statement_timeout_seconds)
+            )
+        remaining = float(deadline) - time.monotonic()
+        if remaining <= 0:
+            raise LedgerOperationTimeout("postgres operation deadline expired")
+        if statement_timeout_seconds is not None:
+            remaining = min(remaining, float(statement_timeout_seconds))
+        return remaining
+
+    @contextmanager
+    def _operation_gate(self, gate: Any, name: str) -> Iterator[None]:
+        """Acquire a ledger lock/semaphore within the caller's deadline."""
+        remaining = self._remaining_operation_timeout()
+        acquired = (
+            gate.acquire()
+            if remaining is None
+            else gate.acquire(timeout=max(0.0, remaining))
+        )
+        if not acquired:
+            raise LedgerOperationTimeout(f"timed out waiting for postgres {name}")
+        try:
+            yield
+        finally:
+            gate.release()
 
     def append(self, pending: PendingShare) -> AcceptedShareRecord:
         if pending.share_difficulty <= 0:
@@ -1062,6 +2372,13 @@ existing_share AS (
     SELECT share_seq
     FROM qbit_share_ledger
     WHERE share_id = (SELECT data->>'share_id' FROM payload)
+),
+existing_miner AS (
+    SELECT 1
+    FROM qbit_share_ledger
+    WHERE accepted
+      AND miner_id = (SELECT data->>'miner_id' FROM payload)
+    LIMIT 1
 ),
 lease AS (
     UPDATE qbit_ledger_writer_lease
@@ -1131,14 +2448,24 @@ SELECT CASE
             'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
             'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
             'ntime', ntime,
-            'credit_policy', credit_policy
+            'credit_policy', credit_policy,
+            'new_miner', NOT EXISTS (SELECT 1 FROM existing_miner)
         ) FROM inserted)
 END;
 """
-        result = self._run_fenced_json(sql)
-        if "error" in result:
-            raise RuntimeError(str(result["error"]))
-        return self._record_from_json(result)
+        # Serialize the single writer through its durable commit and cache note.
+        # Stats reconciliation uses a separate read connection plus a share-seq
+        # watermark, so it never acquires this writer lock.
+        with self._operation_gate(self._lock, "writer lock"):
+            result = self._run_json(sql)
+            if "error" in result:
+                raise RuntimeError(str(result["error"]))
+            record = self._record_from_json(result)
+            self._note_appended_share(
+                record,
+                new_miner=bool(result.get("new_miner", False)),
+            )
+            return record
 
     def append_batch(
         self,
@@ -1231,7 +2558,6 @@ share_mismatch AS (
        OR ledger.template_height IS DISTINCT FROM (data->>'template_height')::bigint
        OR ledger.job_id IS DISTINCT FROM data->>'job_id'
        OR ledger.job_issued_at IS DISTINCT FROM to_timestamp((data->>'job_issued_at_ms')::double precision / 1000.0)
-       OR ledger.accepted_at IS DISTINCT FROM to_timestamp((data->>'accepted_at_ms')::double precision / 1000.0)
        OR ledger.ntime IS DISTINCT FROM (data->>'ntime')::bigint
        OR ledger.credit_policy IS DISTINCT FROM data->>'credit_policy'
 ),
@@ -1246,6 +2572,17 @@ candidate_mismatch AS (
            OR (outbox.candidate IS NOT NULL
                AND (outbox.candidate #- '{{pending_share,accepted_at_ms}}')
                    IS DISTINCT FROM (payload.candidate #- '{{pending_share,accepted_at_ms}}')))
+),
+candidate_states AS (
+    SELECT
+        payload.ordinality,
+        CASE
+            WHEN payload.candidate IS NULL THEN NULL
+            ELSE COALESCE(outbox.state, 'pending')
+        END AS candidate_outbox_state
+    FROM payload
+    LEFT JOIN qbit_block_candidate_outbox outbox
+      ON outbox.block_hash = payload.candidate->>'block_hash_hex'
 ),
 batch_ok AS (
     SELECT 1 AS ok
@@ -1297,13 +2634,34 @@ inserted_candidates AS (
     RETURNING block_hash
 ),
 records AS (
-    SELECT ledger.*, payload.ordinality
+    SELECT
+        ledger.*, payload.ordinality, false AS newly_inserted,
+        false AS new_miner, candidate_states.candidate_outbox_state
     FROM payload
     JOIN qbit_share_ledger ledger ON ledger.share_id = payload.data->>'share_id'
+    JOIN candidate_states ON candidate_states.ordinality = payload.ordinality
     UNION ALL
-    SELECT inserted_shares.*, payload.ordinality
+    SELECT
+        inserted_shares.*, payload.ordinality, true AS newly_inserted,
+        -- Data-modifying CTEs and this main query share one pre-statement
+        -- MVCC snapshot. This base-table probe cannot see inserted_shares;
+        -- only the RETURNING CTE exposes those new rows to this statement.
+        NOT EXISTS (
+            SELECT 1
+            FROM qbit_share_ledger existing_miner
+            WHERE existing_miner.accepted
+              AND existing_miner.miner_id = inserted_shares.miner_id
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM inserted_shares earlier_insert
+            WHERE earlier_insert.miner_id = inserted_shares.miner_id
+              AND earlier_insert.share_seq < inserted_shares.share_seq
+        ) AS new_miner,
+        candidate_states.candidate_outbox_state
     FROM inserted_shares
     JOIN payload ON payload.data->>'share_id' = inserted_shares.share_id
+    JOIN candidate_states ON candidate_states.ordinality = payload.ordinality
 )
 SELECT CASE
     WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
@@ -1333,22 +2691,40 @@ SELECT CASE
                 'job_issued_at_ms', round(extract(epoch FROM records.job_issued_at) * 1000)::bigint,
                 'accepted_at_ms', round(extract(epoch FROM records.accepted_at) * 1000)::bigint,
                 'ntime', records.ntime,
-                'credit_policy', records.credit_policy
+                'credit_policy', records.credit_policy,
+                'newly_inserted', records.newly_inserted,
+                'new_miner', records.new_miner,
+                'candidate_outbox_state', records.candidate_outbox_state
             ) ORDER BY records.ordinality)
             FROM records
         )
     )
 END;
 """
-        result = self._run_fenced_json(sql)
-        if "error" in result:
-            raise RuntimeError(str(result["error"]))
-        records = result.get("records")
-        if not isinstance(records, list) or len(records) != len(entries):
-            raise RuntimeError("Postgres share batch returned an incomplete result")
-        return [self._record_from_json(record) for record in records]
+        with self._operation_gate(self._lock, "writer lock"):
+            result = self._run_json(sql)
+            if "error" in result:
+                raise RuntimeError(str(result["error"]))
+            records = result.get("records")
+            if not isinstance(records, list) or len(records) != len(entries):
+                raise RuntimeError("Postgres share batch returned an incomplete result")
+            parsed = [self._record_from_json(record) for record in records]
+            committed = sorted(
+                zip(records, parsed, strict=True),
+                key=lambda item: item[1].share_seq,
+            )
+            for payload, record in committed:
+                if bool(payload.get("newly_inserted", True)):
+                    self._note_appended_share(
+                        record,
+                        new_miner=bool(payload.get("new_miner", False)),
+                    )
+            return parsed
 
-    def persist_block_candidate_intent(self, candidate: dict[str, Any]) -> bool:
+    def persist_block_candidate_intent(
+        self,
+        candidate: dict[str, Any],
+    ) -> BlockCandidateIntentPersistResult:
         """Persist candidate work that is not yet eligible for share credit."""
         block_hash = str(candidate.get("block_hash_hex", "")).lower()
         if not block_hash:
@@ -1371,7 +2747,7 @@ lease AS (
     RETURNING writer_id
 ),
 existing AS (
-    SELECT candidate_sha256
+    SELECT candidate_sha256, state
     FROM qbit_block_candidate_outbox
     WHERE block_hash = {self._text_literal(block_hash)}
 ),
@@ -1396,13 +2772,19 @@ SELECT CASE
     ) THEN
         json_build_object('error', 'block candidate payload mismatch')
     ELSE
-        json_build_object('inserted', (SELECT count(*) FROM inserted))
+        json_build_object(
+            'inserted', (SELECT count(*) FROM inserted),
+            'state', COALESCE((SELECT state FROM existing), 'pending')
+        )
 END;
 """
         result = self._run_fenced_json(sql)
         if "error" in result:
             raise RuntimeError(str(result["error"]))
-        return int(result.get("inserted", 0)) > 0
+        return BlockCandidateIntentPersistResult(
+            inserted=int(result.get("inserted", 0)) > 0,
+            state=str(result.get("state", "pending")),
+        )
 
     def pending_block_candidates(self, *, limit: int = 32) -> list[dict[str, Any]]:
         return [
@@ -1430,8 +2812,74 @@ FROM (
     LIMIT {int(limit)}
 ) pending;
 """
-        with self._lock:
-            return list(self._run_json(sql))
+        with self._operation_gate(self._lock, "writer lock"):
+            return list(self._run_retry_safe_read_json(sql))
+
+    def block_candidate_pending_metrics(self) -> dict[str, int | float]:
+        """Return aggregate pending ages using the existing outbox index."""
+        sql = """
+SELECT json_build_object(
+    'pending_count', count(*),
+    'oldest_pending_age_seconds', COALESCE(
+        EXTRACT(EPOCH FROM clock_timestamp() - min(created_at)),
+        0
+    ),
+    'oldest_unattempted_age_seconds', COALESCE(
+        EXTRACT(
+            EPOCH FROM clock_timestamp()
+            - min(created_at) FILTER (WHERE attempt_count = 0)
+        ),
+        0
+    )
+)
+FROM qbit_block_candidate_outbox
+WHERE state = 'pending';
+"""
+        with self._operation_gate(self._lock, "writer lock"):
+            metrics = self._run_retry_safe_read_json(sql)
+        return {
+            "pending_count": int(metrics.get("pending_count", 0)),
+            "oldest_pending_age_seconds": float(
+                metrics.get("oldest_pending_age_seconds", 0.0)
+            ),
+            "oldest_unattempted_age_seconds": float(
+                metrics.get("oldest_unattempted_age_seconds", 0.0)
+            ),
+        }
+
+    def mark_block_candidate_attempted(self, *, block_hash: str) -> bool:
+        """Fence and count entry into a candidate processing attempt."""
+        sql = f"""
+WITH lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    WHERE singleton
+      AND writer_id = {self._text_literal(self._writer_id)}
+      AND writer_epoch = {int(self._writer_epoch)}
+      AND writer_session_token = {self._text_literal(self._writer_session_token)}
+    RETURNING writer_id
+),
+updated AS (
+    UPDATE qbit_block_candidate_outbox
+    SET attempt_count = attempt_count + 1,
+        updated_at = clock_timestamp()
+    FROM lease
+    WHERE block_hash = {self._text_literal(block_hash.lower())}
+      AND state = 'pending'
+    RETURNING block_hash
+)
+SELECT CASE
+    WHEN NOT EXISTS (SELECT 1 FROM lease) THEN
+        json_build_object('error', 'writer lease is not active')
+    ELSE
+        json_build_object('updated', (SELECT count(*) FROM updated))
+END;
+"""
+        result = self._run_fenced_json(sql)
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        return int(result.get("updated", 0)) > 0
 
     def mark_block_candidate_submitted(self, *, block_hash: str) -> bool:
         return self._finish_block_candidate(block_hash=block_hash, state="submitted", error=None)
@@ -1456,7 +2904,6 @@ WITH lease AS (
 updated AS (
     UPDATE qbit_block_candidate_outbox
     SET state = {self._text_literal(state)},
-        attempt_count = attempt_count + 1,
         last_error = {self._text_literal(error) if error is not None else 'NULL'},
         updated_at = clock_timestamp(),
         completed_at = clock_timestamp(),
@@ -1500,40 +2947,87 @@ WITH rows AS (
       AND accepted_at <= {anchor}
 )"""
         else:
-            # Only the most-recent shares whose cumulative difficulty covers
-            # window_weight -- a superset of the reward window the audit bundle
-            # selects. compute_prism_window re-sorts by share_seq DESC and stops
-            # at 8x network difficulty, dropping anything older, so a superset
-            # yields the identical counted window and digest. Bounding the walk
-            # here keeps the job-build ledger phase O(window), not O(ledger
-            # history), and stops it growing without bound as the ledger grows.
+            # Find the bounded reward window in indexed pages, then apply one
+            # exact cumulative cutoff over only those pages. The previous
+            # recursive query fetched one row per recursive step; at production
+            # window sizes that meant 100k+ lateral index probes. Paging keeps
+            # the scan O(window), not O(history), while returning the identical
+            # final crossing row and therefore byte-identical audit input.
+            #
+            # The final pass must consume the cutoff as a scalar subquery, not
+            # a joined relation: a join makes the planner apply the cutoff as
+            # a filter after walking the whole pkey backwards, while a scalar
+            # subquery becomes an InitPlan the index scan can use as its start
+            # bound, keeping this pass O(window) too.
+            #
+            # The page-granular stop relies on share_difficulty being NOT NULL
+            # and strictly positive (schema CHECK), which keeps the cumulative
+            # weight strictly increasing so the crossing row always lies in
+            # the last fetched page. The same holds for qbit_prism_window()
+            # in the schema file; relax the constraint and both walks need
+            # revisiting.
             rows_cte = f"""
-WITH RECURSIVE eligible AS (
-    (
-        SELECT ledger.*, ledger.share_difficulty::numeric AS cumulative_difficulty
-        FROM qbit_share_ledger ledger
-        WHERE ledger.accepted
-          AND ledger.job_issued_at <= {anchor}
-          AND ledger.accepted_at <= {anchor}
-        ORDER BY ledger.share_seq DESC
-        LIMIT 1
-    )
+WITH RECURSIVE pages AS (
+    SELECT page.min_share_seq,
+           page.page_weight,
+           page.page_weight AS cumulative_weight
+    FROM LATERAL (
+        SELECT min(page_rows.share_seq) AS min_share_seq,
+               COALESCE(sum(page_rows.share_difficulty), 0)::numeric AS page_weight
+        FROM (
+            SELECT ledger.share_seq, ledger.share_difficulty
+            FROM qbit_share_ledger ledger
+            WHERE ledger.accepted
+              AND ledger.job_issued_at <= {anchor}
+              AND ledger.accepted_at <= {anchor}
+            ORDER BY ledger.share_seq DESC
+            LIMIT 4096
+        ) page_rows
+    ) page
     UNION ALL
-    SELECT next_ledger.*, eligible.cumulative_difficulty + next_ledger.share_difficulty
-    FROM eligible
+    SELECT page.min_share_seq,
+           page.page_weight,
+           pages.cumulative_weight + page.page_weight
+    FROM pages
     CROSS JOIN LATERAL (
-        SELECT ledger.*
-        FROM qbit_share_ledger ledger
-        WHERE ledger.accepted
-          AND ledger.job_issued_at <= {anchor}
-          AND ledger.accepted_at <= {anchor}
-          AND ledger.share_seq < eligible.share_seq
-        ORDER BY ledger.share_seq DESC
-        LIMIT 1
-    ) next_ledger
-    WHERE eligible.cumulative_difficulty < {int(window_weight)}::numeric
+        SELECT min(page_rows.share_seq) AS min_share_seq,
+               COALESCE(sum(page_rows.share_difficulty), 0)::numeric AS page_weight
+        FROM (
+            SELECT ledger.share_seq, ledger.share_difficulty
+            FROM qbit_share_ledger ledger
+            WHERE ledger.accepted
+              AND ledger.job_issued_at <= {anchor}
+              AND ledger.accepted_at <= {anchor}
+              AND ledger.share_seq < pages.min_share_seq
+            ORDER BY ledger.share_seq DESC
+            LIMIT 4096
+        ) page_rows
+    ) page
+    WHERE pages.cumulative_weight < {int(window_weight)}::numeric
+      AND pages.min_share_seq IS NOT NULL
 ),
-rows AS (SELECT * FROM eligible)"""
+page_cutoff AS (
+    SELECT min(min_share_seq) AS min_share_seq
+    FROM pages
+    WHERE min_share_seq IS NOT NULL
+),
+ranked AS (
+    SELECT ledger.*,
+           sum(ledger.share_difficulty) OVER (
+               ORDER BY ledger.share_seq DESC
+               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+           )::numeric AS cumulative_difficulty
+    FROM qbit_share_ledger ledger
+    WHERE ledger.accepted
+      AND ledger.job_issued_at <= {anchor}
+      AND ledger.accepted_at <= {anchor}
+      AND ledger.share_seq >= (SELECT min_share_seq FROM page_cutoff)
+),
+rows AS (
+    SELECT *
+    FROM ranked
+    WHERE cumulative_difficulty - share_difficulty < {int(window_weight)}::numeric
+)"""
         sql = rows_cte + """
 SELECT COALESCE(json_agg(json_build_object(
     'share_seq', share_seq,
@@ -1552,8 +3046,74 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY share_seq ASC), '[]'::json)
 FROM rows;
 """
-        with self._lock:
-            return [self._record_from_json(item) for item in self._run_json(sql)]
+        # Job construction is a retry-safe MVCC read. Use the independent read
+        # pool so an accepted block's fenced bulk write cannot stall replacement
+        # work behind the single-writer connection lock.
+        return [
+            self._record_from_json(item)
+            for item in self._run_read_json(sql)
+        ]
+
+    def snapshot_between_job_issues(
+        self,
+        previous_anchor_job_issued_at_ms: int,
+        anchor_job_issued_at_ms: int,
+    ) -> list[AcceptedShareRecord]:
+        """Return only shares that became anchor-eligible since a snapshot.
+
+        The disjoint UNION branches let Postgres use the accepted-at and
+        job-issued-at indexes independently. A share belongs to exactly one
+        branch according to which timestamp crossed the previous anchor;
+        rows already eligible at that anchor cannot reappear.
+        """
+
+        previous_anchor_ms = int(previous_anchor_job_issued_at_ms)
+        anchor_ms = int(anchor_job_issued_at_ms)
+        if anchor_ms < previous_anchor_ms:
+            raise ValueError("snapshot anchor moved backwards")
+        if anchor_ms == previous_anchor_ms:
+            return []
+        previous_anchor = (
+            f"to_timestamp(({previous_anchor_ms}::double precision / 1000.0))"
+        )
+        anchor = f"to_timestamp(({anchor_ms}::double precision / 1000.0))"
+        sql = f"""
+WITH rows AS (
+    SELECT ledger.*
+    FROM qbit_share_ledger ledger
+    WHERE ledger.accepted
+      AND ledger.accepted_at > {previous_anchor}
+      AND ledger.accepted_at <= {anchor}
+      AND ledger.job_issued_at <= {anchor}
+    UNION ALL
+    SELECT ledger.*
+    FROM qbit_share_ledger ledger
+    WHERE ledger.accepted
+      AND ledger.job_issued_at > {previous_anchor}
+      AND ledger.job_issued_at <= {anchor}
+      AND ledger.accepted_at <= {previous_anchor}
+)
+SELECT COALESCE(json_agg(json_build_object(
+    'share_seq', share_seq,
+    'share_id', share_id,
+    'miner_id', miner_id,
+    'order_key', payout_order_key,
+    'p2mr_program_hex', encode(p2mr_program, 'hex'),
+    'share_difficulty', share_difficulty::text,
+    'network_difficulty', network_difficulty::text,
+    'template_height', template_height,
+    'job_id', job_id,
+    'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
+    'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
+    'ntime', ntime,
+    'credit_policy', credit_policy
+) ORDER BY share_seq ASC), '[]'::json)
+FROM rows;
+"""
+        return [
+            self._record_from_json(item)
+            for item in self._run_read_json(sql)
+        ]
 
     def all_shares(self) -> list[AcceptedShareRecord]:
         sql = """
@@ -1575,30 +3135,199 @@ SELECT COALESCE(json_agg(json_build_object(
 FROM qbit_share_ledger
 WHERE accepted;
 """
-        with self._lock:
-            return [self._record_from_json(item) for item in self._run_json(sql)]
+        with self._operation_gate(self._lock, "writer lock"):
+            return [
+                self._record_from_json(item)
+                for item in self._run_retry_safe_read_json(sql)
+            ]
 
     def accepted_share_stats(self) -> dict[str, int]:
         """Aggregate counts without materializing the full share history.
 
-        Health checks and readiness gates only need these two numbers; the
-        full ``all_shares`` fetch grows with ledger history and is far too
-        heavy to run per health probe or per job build.
+        Health checks and readiness gates only need these two numbers, but
+        they ask for them every few seconds (bundle readiness re-checks, the
+        health refresher, metrics scrapes). Running the aggregate per call
+        parallel-seq-scans the whole ledger each time, so the counts are kept
+        incrementally instead: this process is the single lease-holding
+        writer, every accepted share passes through ``append``/``append_batch``,
+        and the counters are reconciled against the database once per
+        ``accepted_stats_cache_seconds`` in case anything mutated rows out of
+        band (e.g. reorg reversals flipping ``accepted``).
+
+        Reconciliation never blocks a reader that already has counters: an
+        expired read returns the maintained counters immediately and arms a
+        single background refresh. The full-history aggregate takes minutes
+        on a grown ledger, and parking the first expired caller handed that
+        wait to whichever subsystem lost the race -- metrics scrapes,
+        readiness gates, and block-candidate evidence all read these
+        counters from latency-sensitive paths. Only the cold seed (no
+        counters yet) still waits for the exact aggregate.
         """
+        ttl = getattr(self, "_accepted_stats_cache_seconds", 0.0)
+        stats_lock = getattr(self, "_stats_lock", None)
+        if stats_lock is not None and ttl > 0:
+            now = time.monotonic()
+            with stats_lock:
+                if (
+                    self._stats_counts is not None
+                    and self._stats_refreshed_monotonic is not None
+                ):
+                    if now - self._stats_refreshed_monotonic <= ttl:
+                        return dict(self._stats_counts)
+                    counters = dict(self._stats_counts)
+                    self._start_background_stats_reconcile_locked()
+                    return counters
+        return self._refresh_accepted_share_stats()
+
+    def _refresh_accepted_share_stats(self) -> dict[str, int]:
+        # Single-flight: concurrent TTL expiries (health refresher plus a
+        # metrics scrape) must not both run the aggregate and then race their
+        # cache writes, or an older snapshot could overwrite a newer one along
+        # with any increments noted in between. The second caller waits, sees
+        # the fresh cache, and returns it without another query.
+        refresh_lock = getattr(self, "_stats_refresh_lock", None)
+        stats_lock = getattr(self, "_stats_lock", None)
+        if refresh_lock is None or stats_lock is None:
+            return self._query_accepted_share_stats()[0]
+        with refresh_lock:
+            ttl = getattr(self, "_accepted_stats_cache_seconds", 0.0)
+            if ttl > 0:
+                now = time.monotonic()
+                with stats_lock:
+                    if (
+                        self._stats_counts is not None
+                        and self._stats_refreshed_monotonic is not None
+                        and now - self._stats_refreshed_monotonic <= ttl
+                    ):
+                        return dict(self._stats_counts)
+            # Open the note buffer before taking the database snapshot. The
+            # aggregate runs on the concurrent read pool, never under the
+            # writer lock, and returns the highest share sequence visible in
+            # the same MVCC snapshot as its scalar counts.
+            note_buffer: dict[int, bool] = {}
+            with stats_lock:
+                self._stats_note_buffer = note_buffer
+            try:
+                counts, snapshot_max_share_seq = self._query_accepted_share_stats()
+            except BaseException:
+                with stats_lock:
+                    if self._stats_note_buffer is note_buffer:
+                        self._stats_note_buffer = None
+                raise
+            with stats_lock:
+                for share_seq, new_miner in note_buffer.items():
+                    if share_seq <= snapshot_max_share_seq:
+                        continue
+                    counts["accepted_share_count"] += 1
+                    counts["distinct_miner_count"] += int(new_miner)
+                self._stats_counts = dict(counts)
+                self._stats_max_share_seq = max(
+                    [snapshot_max_share_seq, *note_buffer.keys()]
+                )
+                self._stats_note_buffer = None
+                self._stats_refreshed_monotonic = time.monotonic()
+                return dict(self._stats_counts)
+
+    def _start_background_stats_reconcile_locked(self) -> None:
+        """Arm the reconcile aggregate unless one is already running.
+
+        Callers hold ``_stats_lock``. The thread slot, not
+        ``_stats_refresh_lock``, is the single-flight guard here: waiting on
+        the refresh lock would queue the caller behind the running
+        aggregate, which is exactly the wait the stale-serving read removes.
+        """
+        thread = getattr(self, "_stats_background_refresh_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        thread = Thread(
+            target=self._run_background_stats_reconcile,
+            name="prism-share-ledger-stats-reconcile",
+            daemon=True,
+        )
+        self._stats_background_refresh_thread = thread
+        thread.start()
+
+    def _run_background_stats_reconcile(self) -> None:
+        try:
+            self._refresh_accepted_share_stats()
+        except BaseException:
+            # Readers keep the last reconciled counters, which every append
+            # still advances; the next expired read arms another attempt.
+            # Failures no longer surface as caller errors, so they are
+            # counted for accepted_stats_reconcile_status instead.
+            stats_lock = getattr(self, "_stats_lock", None)
+            if stats_lock is not None:
+                with stats_lock:
+                    self._stats_reconcile_failures = (
+                        getattr(self, "_stats_reconcile_failures", 0) + 1
+                    )
+            traceback.print_exc()
+
+    def accepted_stats_reconcile_status(self) -> dict[str, float | int | None]:
+        """Expose reconcile liveness for metrics and alerting.
+
+        Serving maintained counters means a failing aggregate is no longer
+        visible as caller errors, and a wedged reconcile thread occupies the
+        single-flight slot until the process restarts. Both conditions
+        surface here: ``failures`` counts failed background passes, and
+        ``age_seconds`` grows while no reconcile publishes -- including
+        while one is wedged -- so alerting can page on either.
+        """
+        stats_lock = getattr(self, "_stats_lock", None)
+        if stats_lock is None:
+            return {"age_seconds": None, "failures": 0}
+        with stats_lock:
+            refreshed = self._stats_refreshed_monotonic
+            failures = int(getattr(self, "_stats_reconcile_failures", 0))
+        age = None if refreshed is None else max(0.0, time.monotonic() - refreshed)
+        return {"age_seconds": age, "failures": failures}
+
+    def _query_accepted_share_stats(self) -> tuple[dict[str, int], int]:
         sql = """
 SELECT json_build_object(
     'accepted_share_count', count(*),
-    'distinct_miner_count', count(DISTINCT miner_id)
+    'distinct_miner_count', count(DISTINCT miner_id),
+    'max_share_seq', COALESCE(max(share_seq), 0)
 )
 FROM qbit_share_ledger
 WHERE accepted;
 """
-        with self._lock:
-            stats = self._run_json(sql)
-        return {
-            "accepted_share_count": int(stats["accepted_share_count"]),
-            "distinct_miner_count": int(stats["distinct_miner_count"]),
+        payload = self._run_read_json(sql)
+        counts = {
+            "accepted_share_count": int(payload["accepted_share_count"]),
+            "distinct_miner_count": int(payload["distinct_miner_count"]),
         }
+        return counts, int(payload["max_share_seq"])
+
+    def _note_appended_share(
+        self,
+        record: AcceptedShareRecord,
+        *,
+        new_miner: bool,
+    ) -> None:
+        """Advance the cached stats for a share this writer just committed.
+
+        A refresh buffers notes while its aggregate runs, then replays only
+        records newer than the aggregate's share-sequence watermark. The
+        published watermark also suppresses a delayed note for a commit that
+        was already visible in the snapshot. Idempotent ``append_batch``
+        replays are not noted because the batch result identifies rows it
+        actually inserted.
+        """
+        stats_lock = getattr(self, "_stats_lock", None)
+        if stats_lock is None:
+            return
+        with stats_lock:
+            note_buffer = getattr(self, "_stats_note_buffer", None)
+            if note_buffer is not None:
+                note_buffer[record.share_seq] = new_miner
+            if self._stats_counts is None:
+                return
+            if record.share_seq <= self._stats_max_share_seq:
+                return
+            self._stats_counts["accepted_share_count"] += 1
+            self._stats_counts["distinct_miner_count"] += int(new_miner)
+            self._stats_max_share_seq = record.share_seq
 
     def current_owed_balances(self) -> list[dict[str, object]]:
         sql = """
@@ -1611,8 +3340,53 @@ SELECT COALESCE(json_agg(json_build_object(
 FROM qbit_current_owed_balances()
 WHERE owed_balance_sats > 0;
 """
-        with self._lock:
-            balances = self._run_json(sql)
+        with self._operation_gate(self._lock, "writer lock"):
+            balances = self._run_retry_safe_read_json(sql)
+        for balance in balances:
+            balance["balance_sats"] = int(balance["balance_sats"])
+        return balances
+
+    def prior_balances_after_pool_block(
+        self,
+        *,
+        block_hash: str,
+    ) -> list[dict[str, object]]:
+        """Return active carry balances as of one confirmed pool block."""
+        block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
+        sql = f"""
+WITH target AS (
+    SELECT block_height
+    FROM qbit_pool_blocks
+    WHERE block_hash = {self._text_literal(block_hash)}
+      AND chain_state = 'confirmed'
+      AND maturity_state <> 'reversed'
+),
+balances AS (
+    SELECT
+        (array_agg(carry.miner_id ORDER BY carry.payout_order_key, carry.miner_id))[1] AS miner_id,
+        (array_agg(carry.payout_order_key ORDER BY carry.payout_order_key, carry.miner_id))[1] AS payout_order_key,
+        carry.p2mr_program,
+        SUM(carry.gross_amount_sats::numeric - carry.onchain_amount_sats::numeric) AS balance_sats
+    FROM qbit_payout_carry_forward carry
+    JOIN qbit_pool_blocks block
+      ON block.block_hash = carry.block_hash
+    CROSS JOIN target
+    WHERE carry.maturity_state <> 'reversed'
+      AND block.chain_state = 'confirmed'
+      AND block.maturity_state <> 'reversed'
+      AND block.block_height <= target.block_height
+    GROUP BY carry.p2mr_program
+    HAVING SUM(carry.gross_amount_sats::numeric - carry.onchain_amount_sats::numeric) <> 0
+)
+SELECT COALESCE(json_agg(json_build_object(
+    'recipient_id', miner_id,
+    'order_key', payout_order_key,
+    'p2mr_program_hex', encode(p2mr_program, 'hex'),
+    'balance_sats', balance_sats::text
+) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
+FROM balances;
+"""
+        balances = list(self._run_read_json(sql))
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
         return balances
@@ -1627,21 +3401,42 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
 FROM qbit_current_carry_forward_balances();
 """
-        with self._lock:
-            balances = self._run_json(sql)
+        started = time.monotonic()
+        with self._operation_gate(self._lock, "writer lock"):
+            balances = self._run_retry_safe_read_json(sql)
+        self._note_prior_balances_read(max(0.0, time.monotonic() - started))
         for balance in balances:
             balance["balance_sats"] = int(balance["balance_sats"])
         return balances
 
+    def _note_prior_balances_read(self, duration_seconds: float) -> None:
+        with self._prior_balances_read_stats_lock:
+            self._prior_balances_reads_total += 1
+            self._prior_balances_read_last_seconds = duration_seconds
+            self._prior_balances_read_max_seconds = max(
+                self._prior_balances_read_max_seconds, duration_seconds
+            )
+
+    def prior_balances_read_stats(self) -> dict[str, float | int]:
+        """Latency of the prior-balances read, the query whose silent growth
+        past the submitter deadline caused the #188 landing livelock."""
+        with self._prior_balances_read_stats_lock:
+            return {
+                "reads_total": self._prior_balances_reads_total,
+                "last_seconds": self._prior_balances_read_last_seconds,
+                "max_seconds": self._prior_balances_read_max_seconds,
+            }
+
     def carry_forward_integrity_report(self) -> dict[str, object]:
         sql = "SELECT qbit_carry_forward_integrity_report();"
-        with self._lock:
-            report = self._run_json(sql)
+        with self._operation_gate(self._lock, "writer lock"):
+            report = self._run_retry_safe_read_json(sql)
             audit_head = self._carry_forward_audit_head_locked()
         report["backend"] = "postgres-psql"
         report.update(audit_head)
         report["checked_active_rows"] = int(report["checked_active_rows"])
         report["mismatch_count"] = int(report["mismatch_count"])
+        report["current_drift_count"] = int(report.get("current_drift_count", 0))
         for row in report.get("mismatches", []):
             for key in (
                 "prior_balance_sats",
@@ -1682,7 +3477,7 @@ FROM (
       AND block.maturity_state <> 'reversed'
 ) active;
 """
-        rows = self._run_json(sql)
+        rows = self._run_retry_safe_read_json(sql)
         previous = bytes.fromhex("00" * 32)
         version = "qbit.prism.carry-forward-active-delta-chain.v1"
         for row in rows:
@@ -1720,8 +3515,8 @@ FROM qbit_audit_share_window(
     {int(network_difficulty)}::numeric
 );
 """
-        with self._lock:
-            rows = self._run_json(sql)
+        with self._operation_gate(self._lock, "writer lock"):
+            rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             for key in (
                 "window_multiplier",
@@ -1750,8 +3545,8 @@ SELECT COALESCE(json_agg(json_build_object(
 ) ORDER BY payout_order_key, miner_id, encode(p2mr_program, 'hex')), '[]'::json)
 FROM qbit_audit_block_payouts({self._text_literal(block_hash)});
 """
-        with self._lock:
-            rows = self._run_json(sql)
+        with self._operation_gate(self._lock, "writer lock"):
+            rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             row["carry_forward_balance_sats"] = int(row["carry_forward_balance_sats"])
         return rows
@@ -1785,8 +3580,8 @@ FROM (
 JOIN qbit_pool_blocks block
   ON block.block_hash = payout.block_hash;
 """
-        with self._lock:
-            rows = self._run_json(sql)
+        with self._operation_gate(self._lock, "writer lock"):
+            rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             row["carry_forward_balance_sats"] = int(row["carry_forward_balance_sats"])
         return rows
@@ -1902,6 +3697,56 @@ SELECT json_build_object(
             "share_percent": public_api.percent_string(miner_3h_difficulty, pool_3h_difficulty),
         }
 
+    def _pool_reward_window_aggregate(self, window_weight: Decimal) -> dict[str, Any]:
+        """Pool-wide PRISM reward-window totals grouped by miner, briefly cached.
+
+        Every public miner page needs the same pool-wide recursive
+        qbit_prism_window scan and only differs in which miner's slice it
+        reads, so the aggregate is computed once and every miner-page request
+        within the cache window is served from the shared copy. Concurrent
+        misses wait for the in-flight computation instead of re-running it.
+        The cache is keyed by the requested window weight, so a
+        network-difficulty change recomputes immediately; a TTL of 0 disables
+        caching.
+        """
+        from lab.prism import public_api
+
+        window_weight_sql = public_api.decimal_string(window_weight)
+        cache_seconds = self._reward_window_cache_seconds
+        with self._reward_window_cache_lock:
+            cached = self._reward_window_cache
+            if (
+                cache_seconds > 0
+                and cached is not None
+                and cached[0] == window_weight_sql
+                and time.monotonic() - cached[1] < cache_seconds
+            ):
+                return cached[2]
+            sql = f"""
+WITH bounds AS (
+    SELECT clock_timestamp() AS ended_at
+),
+window_rows AS (
+    SELECT window_row.*
+    FROM bounds
+    CROSS JOIN LATERAL qbit_prism_window(bounds.ended_at, {window_weight_sql}::numeric) AS window_row
+)
+SELECT json_build_object(
+    'pool_counted_difficulty', COALESCE((SELECT sum(counted_difficulty) FROM window_rows), 0)::text,
+    'miner_counted_difficulty', COALESCE((
+        SELECT json_object_agg(miner_id, counted_difficulty)
+        FROM (
+            SELECT miner_id, sum(counted_difficulty)::text AS counted_difficulty
+            FROM window_rows
+            GROUP BY miner_id
+        ) grouped
+    ), '{{}}'::json)
+);
+"""
+            payload = self._run_read_json(sql)
+            self._reward_window_cache = (window_weight_sql, time.monotonic(), payload)
+            return payload
+
     def dashboard_miner_reward_window(
         self,
         *,
@@ -1913,30 +3758,10 @@ SELECT json_build_object(
         if not recipient_id:
             raise ValueError("recipient_id is required")
         window_weight = _reward_window_weight(current_network_difficulty)
-        window_weight_sql = public_api.decimal_string(window_weight)
-        sql = f"""
-WITH bounds AS (
-    SELECT clock_timestamp() AS ended_at
-),
-window_rows AS (
-    SELECT window_row.*
-    FROM bounds
-    CROSS JOIN LATERAL qbit_prism_window(bounds.ended_at, {window_weight_sql}::numeric) AS window_row
-),
-totals AS (
-    SELECT
-        COALESCE(sum(counted_difficulty), 0)::text AS pool_counted_difficulty,
-        COALESCE(sum(counted_difficulty) FILTER (WHERE miner_id = {self._text_literal(recipient_id)}), 0)::text AS miner_counted_difficulty
-    FROM window_rows
-)
-SELECT json_build_object(
-    'pool_counted_difficulty', (SELECT pool_counted_difficulty FROM totals),
-    'miner_counted_difficulty', (SELECT miner_counted_difficulty FROM totals)
-);
-"""
-        payload = self._run_read_json(sql)
-        pool_difficulty = Decimal(str(payload["pool_counted_difficulty"]))
-        miner_difficulty = Decimal(str(payload["miner_counted_difficulty"]))
+        aggregate = self._pool_reward_window_aggregate(window_weight)
+        pool_difficulty = Decimal(str(aggregate["pool_counted_difficulty"]))
+        by_miner = aggregate["miner_counted_difficulty"]
+        miner_difficulty = Decimal(str(by_miner.get(recipient_id, "0")))
         share_percent = None
         if pool_difficulty > 0:
             share_percent = public_api.decimal_string(miner_difficulty * Decimal(100) / pool_difficulty)
@@ -2185,6 +4010,9 @@ named AS (
         FROM qbit_share_ledger
         WHERE accepted
           AND miner_id = {self._text_literal(recipient_id)}
+          -- 3 hours is the largest rollup window this endpoint reports
+          -- (h3_difficulty), so the scan never needs the miner's full history.
+          AND accepted_at >= (SELECT now_at FROM bounds) - interval '3 hours'
     ) shares
 ),
 grouped AS (
@@ -2261,8 +4089,8 @@ SELECT COALESCE(
     'null'::json
 );
 """
-        with self._lock:
-            row = self._run_json(sql)
+        with self._operation_gate(self._lock, "writer lock"):
+            row = self._run_retry_safe_read_json(sql)
         return self._resolve_audit_bundle_row(row)
 
     def audit_bundle_by_commitment(self, *, commitment_leaf_hex: str) -> dict[str, object] | None:
@@ -2292,8 +4120,8 @@ SELECT COALESCE(
     'null'::json
 );
 """
-        with self._lock:
-            row = self._run_json(sql)
+        with self._operation_gate(self._lock, "writer lock"):
+            row = self._run_retry_safe_read_json(sql)
         return self._resolve_audit_bundle_row(row)
 
     def persist_ctv_fanout_manifest_set(
@@ -3073,9 +4901,12 @@ END;
         }
 
     def metrics(self) -> dict[str, int]:
+        # The accepted-share count comes from the incrementally maintained
+        # stats (see accepted_share_stats) so metrics scrapes never seq-scan
+        # the share ledger; the block/payout tables stay small.
+        accepted_share_count = int(self.accepted_share_stats()["accepted_share_count"])
         sql = """
 SELECT json_build_object(
-    'shares', (SELECT count(*) FROM qbit_share_ledger WHERE accepted),
     'blocks', (SELECT count(*) FROM qbit_pool_blocks),
     'confirmed_blocks', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'confirmed'),
     'inactive_blocks', (SELECT count(*) FROM qbit_pool_blocks WHERE chain_state = 'inactive'),
@@ -3086,9 +4917,11 @@ SELECT json_build_object(
     'ctv_fanouts_failed', (SELECT count(*) FROM qbit_ctv_fanout_artifacts WHERE settlement_status = 'failed')
 );
 """
-        with self._lock:
-            metrics = self._run_json(sql)
-        return {str(key): int(value) for key, value in metrics.items()}
+        with self._operation_gate(self._lock, "writer lock"):
+            metrics = self._run_retry_safe_read_json(sql)
+        report = {str(key): int(value) for key, value in metrics.items()}
+        report["shares"] = accepted_share_count
+        return report
 
     def dashboard_pool_snapshot(
         self,
@@ -3428,6 +5261,199 @@ SELECT json_build_object(
             "rows": rows,
         }
 
+    def dashboard_reward_leaderboard(
+        self,
+        *,
+        page: int,
+        limit: int,
+        current_network_difficulty: int | str | Decimal,
+        search: str | None = None,
+        recipient_id: str | None = None,
+    ) -> dict[str, object]:
+        from lab.prism import public_api
+
+        if search is not None and recipient_id is not None:
+            raise ValueError("search and recipient_id are mutually exclusive")
+        offset = (page - 1) * limit
+        network_difficulty = public_api.decimal_string(current_network_difficulty)
+        requested_window_weight = _reward_window_weight(current_network_difficulty)
+        requested_window_weight_sql = public_api.decimal_string(requested_window_weight)
+        row_filter = ""
+        if recipient_id is not None:
+            row_filter = f"WHERE ranked.miner_id = {self._text_literal(recipient_id)}"
+        elif search:
+            row_filter = (
+                "WHERE strpos(lower(ranked.miner_id), "
+                f"{self._text_literal(search.lower())}) > 0"
+            )
+        sql = f"""
+WITH snapshot_clock AS (
+    SELECT clock_timestamp() AS ended_at
+),
+window_rows AS MATERIALIZED (
+    SELECT window_row.*
+    FROM snapshot_clock
+    CROSS JOIN LATERAL qbit_prism_window(
+        snapshot_clock.ended_at,
+        {requested_window_weight_sql}::numeric
+    ) AS window_row
+),
+window_summary AS (
+    SELECT
+        count(*) AS included_share_count,
+        COALESCE(sum(counted_difficulty), 0) AS counted_window_weight,
+        min(accepted_at) AS oldest_share_accepted_at
+    FROM window_rows
+),
+grouped AS (
+    SELECT
+        miner_id,
+        count(*) AS included_share_count,
+        sum(counted_difficulty) AS counted_share_difficulty,
+        max(accepted_at) AS last_share_at
+    FROM window_rows
+    GROUP BY miner_id
+),
+blocks AS (
+    SELECT solver.miner_id, count(*) AS blocks_found_total
+    FROM qbit_pool_blocks block
+    JOIN LATERAL (
+        SELECT share.miner_id
+        FROM qbit_share_ledger share
+        WHERE share.accepted
+          AND length(share.share_id) >= 65
+          AND lower(right(share.share_id, 64)) = block.block_hash
+        ORDER BY share.accepted_at DESC, share.share_seq DESC
+        LIMIT 1
+    ) solver ON true
+    WHERE block.chain_state <> 'reversed'
+    GROUP BY solver.miner_id
+),
+ranked AS (
+    SELECT
+        row_number() OVER (ORDER BY grouped.counted_share_difficulty DESC, grouped.miner_id ASC) AS rank,
+        grouped.miner_id,
+        grouped.included_share_count,
+        grouped.counted_share_difficulty,
+        grouped.last_share_at,
+        COALESCE(blocks.blocks_found_total, 0) AS blocks_found_total
+    FROM grouped
+    LEFT JOIN blocks
+      ON blocks.miner_id = grouped.miner_id
+),
+filtered AS (
+    SELECT *
+    FROM ranked
+    {row_filter}
+),
+page_rows AS (
+    SELECT *
+    FROM filtered
+    ORDER BY rank ASC
+    LIMIT {int(limit)} OFFSET {int(offset)}
+)
+SELECT json_build_object(
+    'ended_at', to_char(snapshot_clock.ended_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    'oldest_share_accepted_at', to_char(window_summary.oldest_share_accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+    'observed_span_seconds', CASE
+        WHEN window_summary.oldest_share_accepted_at IS NULL THEN null
+        ELSE GREATEST(
+            0,
+            floor(extract(epoch FROM (snapshot_clock.ended_at - window_summary.oldest_share_accepted_at)))::bigint
+        )
+    END,
+    'counted_window_weight', window_summary.counted_window_weight::text,
+    'included_share_count', window_summary.included_share_count,
+    'participant_count', (SELECT count(*) FROM ranked),
+    'total_count', (SELECT count(*) FROM filtered),
+    'rows', COALESCE((
+        SELECT json_agg(json_build_object(
+            'rank', page_rows.rank,
+            'recipient_id', page_rows.miner_id,
+            'display_name', null,
+            'included_share_count', page_rows.included_share_count,
+            'counted_share_difficulty', page_rows.counted_share_difficulty::text,
+            'share_percent', CASE
+                WHEN window_summary.counted_window_weight > 0 THEN
+                    (page_rows.counted_share_difficulty * 100::numeric / window_summary.counted_window_weight)::text
+                ELSE null
+            END,
+            'blocks_found_total', page_rows.blocks_found_total,
+            'last_share_at', to_char(page_rows.last_share_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+        ) ORDER BY page_rows.rank ASC)
+        FROM page_rows
+    ), '[]'::json)
+)
+FROM snapshot_clock
+CROSS JOIN window_summary;
+"""
+        payload = self._run_read_json(sql)
+        counted_window_weight = Decimal(str(payload["counted_window_weight"]))
+        observed_span_seconds = (
+            int(payload["observed_span_seconds"])
+            if payload.get("observed_span_seconds") is not None
+            else None
+        )
+        pool_hashrate_ths = None
+        expected_time_to_block = None
+        if observed_span_seconds is not None and observed_span_seconds > 0 and counted_window_weight > 0:
+            pool_hashrate_ths = public_api.hashrate_ths_from_difficulty(
+                counted_window_weight,
+                observed_span_seconds,
+            )
+            expected_time_to_block = public_api.expected_time_to_block_seconds(
+                hashrate_ths=pool_hashrate_ths,
+                network_difficulty=network_difficulty,
+            )
+
+        rows: list[dict[str, object]] = []
+        for row in payload["rows"]:
+            counted_share_difficulty = public_api.decimal_string(row["counted_share_difficulty"])
+            hashrate_ths = None
+            if observed_span_seconds is not None and observed_span_seconds > 0:
+                hashrate_ths = public_api.hashrate_ths_from_difficulty(
+                    counted_share_difficulty,
+                    observed_span_seconds,
+                )
+            share_percent = row["share_percent"]
+            rows.append(
+                {
+                    "rank": int(row["rank"]),
+                    "recipient_id": row["recipient_id"],
+                    "display_name": row["display_name"],
+                    "hashrate_ths": hashrate_ths,
+                    "included_share_count": int(row["included_share_count"]),
+                    "counted_share_difficulty": counted_share_difficulty,
+                    "share_percent": public_api.decimal_string(share_percent) if share_percent is not None else None,
+                    "blocks_found_total": int(row["blocks_found_total"]),
+                    "last_share_at": row["last_share_at"],
+                }
+            )
+
+        participant_count = int(payload["participant_count"])
+        return {
+            "window": {
+                "id": "reward",
+                "started_at": payload["oldest_share_accepted_at"],
+                "ended_at": payload["ended_at"],
+                "observed_span_seconds": observed_span_seconds,
+                "network_difficulty": network_difficulty,
+                "window_multiplier": 8,
+                "requested_window_weight": requested_window_weight_sql,
+                "counted_window_weight": public_api.decimal_string(counted_window_weight),
+                "included_share_count": int(payload["included_share_count"]),
+                "is_complete": requested_window_weight > 0 and counted_window_weight >= requested_window_weight,
+            },
+            "totals": {
+                "pool_hashrate_ths": pool_hashrate_ths,
+                "pool_counted_share_difficulty": public_api.decimal_string(counted_window_weight),
+                "participant_count": participant_count,
+                "expected_time_to_block_seconds": expected_time_to_block,
+            },
+            "pagination": public_api.pagination(page, limit, int(payload["total_count"])),
+            "rows": rows,
+        }
+
     def dashboard_hashrate_series(
         self,
         *,
@@ -3435,17 +5461,34 @@ SELECT json_build_object(
         subject_id: str | None,
         range_id: str,
         bucket: str,
+        lookback_seconds: int = 0,
+        range_anchor_epoch: int | None = None,
     ) -> list[dict[str, object]]:
         from lab.prism import public_api
 
         bucket_seconds = {"5m": 300, "1h": 3600, "1d": 86400}[bucket]
-        range_filter = {
-            "1w": "AND ledger.accepted_at >= bounds.ended_at - interval '7 days'",
-            "1m": "AND ledger.accepted_at >= bounds.ended_at - interval '30 days'",
-            "6m": "AND ledger.accepted_at >= bounds.ended_at - interval '180 days'",
-            "window": "AND ledger.accepted_at >= bounds.ended_at - interval '3 hours'",
-            "all": "",
+        range_interval = {
+            "1w": "7 days",
+            "1m": "30 days",
+            "6m": "180 days",
+            "window": "3 hours",
+            "all": None,
         }[range_id]
+        range_filter = ""
+        if range_interval is not None:
+            # Anchor the range lower bound on the caller's clock when provided
+            # so it agrees with the caller's min_epoch trim even when the
+            # database clock disagrees with the application clock.
+            range_anchor_sql = (
+                f"to_timestamp({int(range_anchor_epoch)})"
+                if range_anchor_epoch is not None
+                else "bounds.ended_at"
+            )
+            range_filter = f"AND ledger.accepted_at >= {range_anchor_sql} - interval '{range_interval}'"
+            if lookback_seconds > 0:
+                # Pre-range context requested by the smoother; the caller trims
+                # these buckets from the response after windowing.
+                range_filter += f" - interval '{int(lookback_seconds)} seconds'"
         subject_filter = ""
         if subject_type == "miner":
             subject_filter = f"AND ledger.miner_id = {self._text_literal(str(subject_id))}"
@@ -3560,9 +5603,13 @@ FROM bucketed;
         share_parts = self._audit_share_parts(shares)
         if share_parts is None or not any(part.get("kind") == "segment" for part in share_parts):
             return None
-        bundle_without_shares = copy.deepcopy(final_bundle)
-        shares_key_index = list(bundle_without_shares).index("shares")
-        bundle_without_shares.pop("shares", None)
+        shares_key_index = list(final_bundle).index("shares")
+        # Persistence only reads this immutable build result.  A shallow outer
+        # mapping avoids recursively copying both the top-level shares and the
+        # reward-manifest share window merely to remove one key.
+        bundle_without_shares = {
+            key: value for key, value in final_bundle.items() if key != "shares"
+        }
         return {
             "schema": AUDIT_BODY_REF_SCHEMA,
             "block_hash": block_hash,
@@ -3590,9 +5637,10 @@ FROM bucketed;
         share_parts = self._audit_share_range_parts(shares)
         if share_parts is None:
             return None
-        bundle_without_shares = copy.deepcopy(final_bundle)
-        shares_key_index = list(bundle_without_shares).index("shares")
-        bundle_without_shares.pop("shares", None)
+        shares_key_index = list(final_bundle).index("shares")
+        bundle_without_shares = {
+            key: value for key, value in final_bundle.items() if key != "shares"
+        }
         reward_manifest = final_bundle.get("reward_manifest")
         proof: dict[str, Any] = {
             "schema": AUDIT_WINDOW_COMPLETENESS_PROOF_SCHEMA,
@@ -3617,7 +5665,7 @@ FROM bucketed;
                 "share_slice_digest_hex",
             ):
                 if key in reward_manifest:
-                    proof[key] = copy.deepcopy(reward_manifest[key])
+                    proof[key] = reward_manifest[key]
         return {
             "schema": AUDIT_BUNDLE_V2_SCHEMA,
             "block_hash": block_hash,
@@ -3677,7 +5725,7 @@ FROM bucketed;
                         "first_share_seq": chunk_seqs[0],
                         "last_share_seq": chunk_seqs[-1],
                         "share_count": len(chunk),
-                        "shares": copy.deepcopy(chunk),
+                        "shares": chunk,
                     }
                 )
             index = end
@@ -3736,7 +5784,7 @@ FROM bucketed;
             "first_share_seq": first_share_seq,
             "last_share_seq": last_share_seq,
             "share_count": len(shares),
-            "shares": copy.deepcopy(shares),
+            "shares": shares,
         }
 
     def _write_audit_share_segment(
@@ -3759,7 +5807,7 @@ FROM bucketed;
             f"prism-audit-share-segment-{first_share_seq}-{last_share_seq}-{segment_sha256}.json"
         )
         if segment_path.exists():
-            if segment_path.read_bytes() != segment_bytes:
+            if not self._file_matches_bytes(segment_path, segment_bytes):
                 raise RuntimeError(f"existing audit share segment does not match payload at {segment_path}")
         else:
             self._write_bytes_atomically(segment_path, segment_bytes)
@@ -3781,11 +5829,26 @@ FROM bucketed;
         segment_path = self._audit_body_dir.resolve() / (
             f"prism-audit-share-segment-slot-{segment_first_share_seq}-{segment_last_share_seq}.json"
         )
-        merged_shares = copy.deepcopy(shares)
+        range_payload = self._audit_share_segment_payload(
+            first_share_seq=first_share_seq,
+            last_share_seq=last_share_seq,
+            shares=shares,
+        )
+        # Encode the incoming range once.  Completed 10k slots dominate normal
+        # block persistence; byte equality lets them return without parsing,
+        # merging, deep-copying, or serializing the existing slot tree.
+        range_bytes = self._storage_json_bytes(range_payload)
+        range_sha256 = sha256_bytes_hex(range_bytes)
+        if segment_path.exists() and self._file_matches_bytes(segment_path, range_bytes):
+            return str(segment_path), range_sha256
+
+        merged_shares = shares
+        existing_bytes: bytes | None = None
         if segment_path.exists():
             try:
-                existing = json.loads(segment_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
+                existing_bytes = segment_path.read_bytes()
+                existing = json.loads(existing_bytes)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise RuntimeError(f"existing audit share segment is not valid JSON at {segment_path}") from exc
             if not isinstance(existing, dict) or existing.get("schema") != AUDIT_SHARE_SEGMENT_SCHEMA:
                 raise RuntimeError(f"existing audit share segment has invalid schema at {segment_path}")
@@ -3797,23 +5860,44 @@ FROM bucketed;
                 shares,
                 segment_path=segment_path,
             )
+            if merged_shares is None:
+                # Keep prior body_uri references valid at the stable slot path,
+                # while the new bundle uses an immutable incoming-only segment.
+                fresh_uri, fresh_sha256 = self._write_audit_share_segment(
+                    first_share_seq=first_share_seq,
+                    last_share_seq=last_share_seq,
+                    shares=shares,
+                )
+                if fresh_sha256 != range_sha256:
+                    raise RuntimeError("audit share segment range hash changed during fallback")
+                try:
+                    self._quarantine_audit_share_segment(
+                        segment_path,
+                        expected_bytes=existing_bytes,
+                    )
+                except OSError:
+                    # The stable slot already preserves the old range, and the
+                    # immutable file preserves the incoming one. A quarantine
+                    # snapshot failure must not wedge block finalization.
+                    pass
+                return fresh_uri, range_sha256
         segment_first = int(merged_shares[0]["share_seq"])
         segment_last = int(merged_shares[-1]["share_seq"])
-        segment = self._audit_share_segment_payload(
-            first_share_seq=segment_first,
-            last_share_seq=segment_last,
-            shares=merged_shares,
-        )
-        segment_bytes = self._storage_json_bytes(segment)
-        if not segment_path.exists() or segment_path.read_bytes() != segment_bytes:
+        if (
+            segment_first == first_share_seq
+            and segment_last == last_share_seq
+            and len(merged_shares) == len(shares)
+        ):
+            segment_bytes = range_bytes
+        else:
+            segment = self._audit_share_segment_payload(
+                first_share_seq=segment_first,
+                last_share_seq=segment_last,
+                shares=merged_shares,
+            )
+            segment_bytes = self._storage_json_bytes(segment)
+        if existing_bytes != segment_bytes:
             self._write_bytes_atomically(segment_path, segment_bytes)
-
-        range_payload = self._audit_share_segment_payload(
-            first_share_seq=first_share_seq,
-            last_share_seq=last_share_seq,
-            shares=shares,
-        )
-        range_sha256 = sha256_bytes_hex(self._storage_json_bytes(range_payload))
         return str(segment_path), range_sha256
 
     def _merge_audit_share_ranges(
@@ -3822,22 +5906,121 @@ FROM bucketed;
         incoming_shares: list[Any],
         *,
         segment_path: Path,
-    ) -> list[Any]:
+    ) -> list[Any] | None:
         if not existing_shares:
-            return copy.deepcopy(incoming_shares)
+            return list(incoming_shares)
         existing_by_seq = self._audit_shares_by_seq(existing_shares, segment_path=segment_path)
         incoming_by_seq = self._audit_shares_by_seq(incoming_shares, segment_path=segment_path)
         for share_seq, incoming in incoming_by_seq.items():
             existing = existing_by_seq.get(share_seq)
             if existing is not None and existing != incoming:
-                raise RuntimeError(f"existing audit share segment conflicts at share_seq {share_seq} in {segment_path}")
+                raise _AuditShareSegmentConflict(
+                    f"existing audit share segment conflicts at share_seq {share_seq} in {segment_path}"
+                )
         merged_by_seq = {**existing_by_seq, **incoming_by_seq}
         ordered_seqs = sorted(merged_by_seq)
         if any(current + 1 != nxt for current, nxt in zip(ordered_seqs, ordered_seqs[1:])):
-            raise RuntimeError(f"existing audit share segment would become non-contiguous at {segment_path}")
-        return [copy.deepcopy(merged_by_seq[share_seq]) for share_seq in ordered_seqs]
+            # A skipped finalize can leave an otherwise valid slot behind the
+            # incoming range. Repair that hole from the append-only ledger.
+            gap_before, gap_after = next(
+                (current, nxt)
+                for current, nxt in zip(ordered_seqs, ordered_seqs[1:])
+                if current + 1 != nxt
+            )
+            missing_first = gap_before + 1
+            missing_last = gap_after - 1
+            try:
+                durable_shares = self._load_audit_share_ledger_range(
+                    first_share_seq=missing_first,
+                    last_share_seq=missing_last,
+                )
+            except _AuditShareSegmentConflict:
+                raise
+            except Exception:
+                # This read is a recovery aid; its failure must not turn the
+                # original slot gap into another permanent finalize failure.
+                durable_shares = None
+            if durable_shares is not None:
+                try:
+                    durable_by_seq = self._audit_shares_by_seq(
+                        durable_shares,
+                        segment_path=segment_path,
+                        require_contiguous=False,
+                    )
+                except _AuditShareSegmentConflict:
+                    raise
+                except RuntimeError:
+                    durable_by_seq = {}
+                if sorted(durable_by_seq) == list(range(missing_first, missing_last + 1)):
+                    merged_by_seq.update(durable_by_seq)
+                    ordered_seqs = sorted(merged_by_seq)
+                    if not any(
+                        current + 1 != nxt
+                        for current, nxt in zip(ordered_seqs, ordered_seqs[1:])
+                    ):
+                        return [merged_by_seq[share_seq] for share_seq in ordered_seqs]
+            # The incoming range is independently complete and remains usable.
+            # The caller preserves this slot and gives that range a fresh URI.
+            return None
+        return [merged_by_seq[share_seq] for share_seq in ordered_seqs]
 
-    def _audit_shares_by_seq(self, shares: list[Any], *, segment_path: Path) -> dict[int, Any]:
+    def _load_audit_share_ledger_range(
+        self,
+        *,
+        first_share_seq: int,
+        last_share_seq: int,
+    ) -> list[dict[str, object]]:
+        sql = f"""
+SELECT COALESCE(json_agg(json_build_object(
+    'share_seq', share_seq,
+    'share_id', share_id,
+    'miner_id', miner_id,
+    'order_key', payout_order_key,
+    'p2mr_program_hex', encode(p2mr_program, 'hex'),
+    'share_difficulty', share_difficulty::text,
+    'network_difficulty', network_difficulty::text,
+    'template_height', template_height,
+    'job_id', job_id,
+    'job_issued_at_ms', round(extract(epoch FROM job_issued_at) * 1000)::bigint,
+    'accepted_at_ms', round(extract(epoch FROM accepted_at) * 1000)::bigint,
+    'ntime', ntime,
+    'credit_policy', credit_policy
+) ORDER BY share_seq ASC), '[]'::json)
+FROM qbit_share_ledger
+WHERE accepted
+  AND share_seq BETWEEN {int(first_share_seq)} AND {int(last_share_seq)};
+"""
+        rows = self._run_read_json(sql)
+        if not isinstance(rows, list):
+            raise RuntimeError("audit share ledger backfill did not return a list")
+        return [self._record_from_json(row).to_prism_json() for row in rows]
+
+    def _quarantine_audit_share_segment(
+        self,
+        segment_path: Path,
+        *,
+        expected_bytes: bytes,
+    ) -> Path:
+        for existing_path in segment_path.parent.glob(f"{segment_path.name}.conflict-*"):
+            if self._file_matches_bytes(existing_path, expected_bytes):
+                return existing_path
+        timestamp = time.time_ns()
+        quarantine_path = segment_path.with_name(f"{segment_path.name}.conflict-{timestamp}")
+        while quarantine_path.exists():
+            timestamp += 1
+            quarantine_path = segment_path.with_name(f"{segment_path.name}.conflict-{timestamp}")
+        # Snapshot rather than move: previously finalized bundles retain this
+        # stable slot URI, so it must remain readable across crashes and retries.
+        self._write_bytes_atomically(quarantine_path, expected_bytes)
+        return quarantine_path
+
+    def _audit_shares_by_seq(
+        self,
+        shares: list[Any],
+        *,
+        segment_path: Path,
+        require_contiguous: bool = True,
+    ) -> dict[int, Any]:
         by_seq: dict[int, Any] = {}
         for share in shares:
             if not isinstance(share, dict):
@@ -3848,15 +6031,34 @@ FROM bucketed;
                 raise RuntimeError(f"audit share segment has invalid share_seq at {segment_path}") from exc
             existing = by_seq.get(share_seq)
             if existing is not None and existing != share:
-                raise RuntimeError(f"audit share segment has duplicate conflicting share_seq {share_seq} at {segment_path}")
-            by_seq[share_seq] = copy.deepcopy(share)
+                raise _AuditShareSegmentConflict(
+                    f"audit share segment has duplicate conflicting share_seq {share_seq} at {segment_path}"
+                )
+            by_seq[share_seq] = share
         ordered = sorted(by_seq)
-        if any(current + 1 != nxt for current, nxt in zip(ordered, ordered[1:])):
+        if require_contiguous and any(current + 1 != nxt for current, nxt in zip(ordered, ordered[1:])):
             raise RuntimeError(f"audit share segment has non-contiguous share_seq values at {segment_path}")
         return by_seq
 
     def _storage_json_bytes(self, payload: dict[str, Any]) -> bytes:
         return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+    @staticmethod
+    def _file_matches_bytes(path: Path, expected: bytes) -> bool:
+        try:
+            if path.stat().st_size != len(expected):
+                return False
+            offset = 0
+            view = memoryview(expected)
+            with path.open("rb") as handle:
+                while offset < len(expected):
+                    chunk = handle.read(min(1024 * 1024, len(expected) - offset))
+                    if not chunk or chunk != view[offset : offset + len(chunk)]:
+                        return False
+                    offset += len(chunk)
+                return not handle.read(1)
+        except OSError:
+            return False
 
     def _write_bytes_atomically(self, path: Path, payload: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3872,6 +6074,68 @@ FROM bucketed;
                 tmp_path.unlink()
             except FileNotFoundError:
                 pass
+
+    def _write_json_atomically(self, path: Path, payload: dict[str, Any]) -> None:
+        """Stream compact JSON through the existing fsync-and-rename boundary."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        encoder = json.JSONEncoder(separators=(",", ":"))
+        try:
+            with tmp_path.open("xb") as handle:
+                for chunk in encoder.iterencode(payload):
+                    handle.write(chunk.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            tmp_path.replace(path)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _file_matches_json_payload(self, path: Path, payload: dict[str, Any]) -> bool:
+        """Compare compact JSON exactly without materializing expected bytes."""
+        expected_digest = hashlib.sha256()
+        expected_length = 0
+        encoder = json.JSONEncoder(separators=(",", ":"))
+        for chunk in encoder.iterencode(payload):
+            encoded = chunk.encode("utf-8")
+            expected_digest.update(encoded)
+            expected_length += len(encoded)
+        try:
+            return (
+                path.stat().st_size == expected_length
+                and hmac.compare_digest(
+                    self._file_sha256_hex(path),
+                    expected_digest.hexdigest(),
+                )
+            )
+        except OSError:
+            return False
+
+    def _copy_file_atomically(self, path: Path, source: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with source.open("rb") as input_handle, tmp_path.open("xb") as output_handle:
+                while chunk := input_handle.read(1024 * 1024):
+                    output_handle.write(chunk)
+                output_handle.flush()
+                os.fsync(output_handle.fileno())
+            tmp_path.replace(path)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _file_sha256_hex(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _write_external_audit_body(
         self,
@@ -4008,15 +6272,24 @@ END;
             return None
         return str(self._audit_body_path(payload["block_hash"], payload["audit_bundle_sha256"]))
 
-    def _audit_body_byte_len(self, body_uri: object | None, final_bundle: dict[str, Any]) -> int:
+    def _audit_body_byte_len(
+        self,
+        body_uri: object | None,
+        final_bundle: dict[str, Any],
+        canonical_bundle_path: Path | None = None,
+    ) -> int:
         if body_uri:
             return self._resolve_audit_body_path(body_uri).stat().st_size
+        if canonical_bundle_path is not None:
+            return canonical_bundle_path.stat().st_size
         return len(self._canonical_audit_bundle_bytes(final_bundle))
 
     def _prepare_external_audit_body(
         self,
         payload: dict[str, Any],
         final_bundle: dict[str, Any],
+        *,
+        canonical_bundle_path: Path | None = None,
     ) -> str | None:
         if self._audit_body_dir is None:
             return None
@@ -4029,16 +6302,56 @@ END;
                 expected_bytes=32,
             ),
         }
-        body_bytes = self._canonical_audit_body_bytes_for_sha(
-            final_bundle,
-            str(payload["audit_bundle_sha256"]),
-        )
+        expected_sha256 = str(payload["audit_bundle_sha256"])
+        body_bytes: bytes | None = None
+        if canonical_bundle_path is not None:
+            canonical_bundle_path = canonical_bundle_path.resolve()
+            try:
+                actual_sha256 = self._file_sha256_hex(canonical_bundle_path)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"canonical audit bundle is not retrievable at {canonical_bundle_path}: {exc}"
+                ) from exc
+            if actual_sha256 != expected_sha256:
+                raise RuntimeError(
+                    "audit bundle sha256 mismatch: "
+                    f"expected {expected_sha256}, got {actual_sha256}"
+                )
+        else:
+            body_bytes = self._canonical_audit_body_bytes_for_sha(
+                final_bundle,
+                expected_sha256,
+            )
         body_uri = self._external_audit_body_write_plan(payload)
         if body_uri is None:
             return None
         body_path = self._resolve_audit_body_path(body_uri)
+        storage_payload = self._audit_bundle_v2(
+            block_hash=str(payload["block_hash"]),
+            audit_bundle_sha256=expected_sha256,
+            final_bundle=final_bundle,
+        )
+        if storage_payload is None:
+            storage_payload = self._audit_body_ref(
+                block_hash=str(payload["block_hash"]),
+                audit_bundle_sha256=expected_sha256,
+                final_bundle=final_bundle,
+            )
         if body_path.exists():
-            if not self._external_body_matches_sha(body_path, str(payload["audit_bundle_sha256"])):
+            if storage_payload is not None and self._file_matches_json_payload(
+                body_path, storage_payload
+            ):
+                return str(body_path)
+            if (
+                storage_payload is None
+                and canonical_bundle_path is not None
+                and self._file_sha256_hex(body_path) == expected_sha256
+            ):
+                return str(body_path)
+            # Preserve compatibility with bodies written by an older storage
+            # layout. This expensive reconstruction is only the mismatch path;
+            # same-version crash retries take the bounded exact-match path.
+            if not self._external_body_matches_sha(body_path, expected_sha256):
                 raise RuntimeError(f"existing audit bundle body does not match payload at {body_path}")
             return str(body_path)
         canonical_body_path = self._audit_body_path(
@@ -4050,26 +6363,14 @@ END;
                 "existing audit bundle body pointer does not match canonical external path: "
                 f"{body_uri}"
             )
-        storage_bytes = self._external_audit_storage_bytes(
-            block_hash=str(payload["block_hash"]),
-            audit_bundle_sha256=str(payload["audit_bundle_sha256"]),
-            final_bundle=final_bundle,
-            canonical_body_bytes=body_bytes,
-        )
-        restored_body_uri = self._write_external_audit_body(
-            str(payload["block_hash"]),
-            str(payload["audit_bundle_sha256"]),
-            storage_bytes,
-        )
-        if restored_body_uri is None:
-            raise RuntimeError("audit body store is not configured")
-        restored_body_path = Path(restored_body_uri).resolve()
-        if restored_body_path != body_path:
-            raise RuntimeError(
-                "existing audit bundle body pointer does not match canonical external path: "
-                f"{body_uri}"
-            )
-        return restored_body_uri
+        if storage_payload is not None:
+            self._write_json_atomically(body_path, storage_payload)
+        elif canonical_bundle_path is not None:
+            self._copy_file_atomically(body_path, canonical_bundle_path)
+        else:
+            assert body_bytes is not None
+            self._write_bytes_atomically(body_path, body_bytes)
+        return str(body_path)
 
     def _read_external_body(
         self,
@@ -4196,7 +6497,9 @@ END;
                     raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid inline shares")
                 if len(inline_shares) != int(part.get("share_count") or 0):
                     raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: inline share count mismatch")
-                shares.extend(copy.deepcopy(inline_shares))
+                # The body was freshly parsed for this request; transfer its
+                # share objects into the reconstructed bundle without cloning.
+                shares.extend(inline_shares)
             else:
                 raise RuntimeError(f"audit bundle body is not valid JSON at {body_uri}: invalid share part kind")
         expected_share_count = int(body_ref.get("share_count") or 0)
@@ -4213,7 +6516,7 @@ END;
             if index == shares_key_index:
                 bundle["shares"] = shares
                 shares_inserted = True
-            bundle[str(key)] = copy.deepcopy(value)
+            bundle[str(key)] = value
         if not shares_inserted:
             bundle["shares"] = shares
         if expected:
@@ -4285,7 +6588,7 @@ END;
             if index == shares_key_index:
                 bundle["shares"] = shares
                 shares_inserted = True
-            bundle[str(key)] = copy.deepcopy(value)
+            bundle[str(key)] = value
         if not shares_inserted:
             bundle["shares"] = shares
         actual = sha256_bytes_hex(self._canonical_audit_bundle_bytes(bundle))
@@ -4375,7 +6678,8 @@ END;
                 )
         elif kind != "segment":
             raise RuntimeError(f"audit bundle body is not valid JSON at {parent_body_uri}: invalid share part kind")
-        return copy.deepcopy(selected_shares)
+        # selected_shares references a freshly parsed, request-local segment.
+        return selected_shares
 
     def _select_audit_share_segment_range(
         self,
@@ -4443,6 +6747,7 @@ END;
         parent_hash: str,
         final_bundle: dict[str, Any],
         audit_report: dict[str, Any],
+        canonical_bundle_path: Path | None = None,
     ) -> dict[str, int | str]:
         manifest = final_bundle["signed_coinbase_manifest"]["manifest"]
         found_block = final_bundle.get("found_block") or {}
@@ -4465,8 +6770,16 @@ END;
             "writer_epoch": self._writer_epoch,
             "writer_session_token": self._writer_session_token,
         }
-        body_uri = self._prepare_external_audit_body(payload, final_bundle)
-        audit_body_byte_len = self._audit_body_byte_len(body_uri, final_bundle)
+        body_uri = self._prepare_external_audit_body(
+            payload,
+            final_bundle,
+            canonical_bundle_path=canonical_bundle_path,
+        )
+        audit_body_byte_len = self._audit_body_byte_len(
+            body_uri,
+            final_bundle,
+            canonical_bundle_path,
+        )
         payload = {
             **payload,
             # Externalized rows store the body in body_uri and NULL here; legacy
@@ -4853,6 +7166,35 @@ SELECT json_build_object(
             "confirmed_count": int(result["confirmed_count"]),
         }
 
+    def pool_block_state(self, *, block_hash: str) -> dict[str, object] | None:
+        block_hash = canonical_hex(block_hash, name="block_hash", expected_bytes=32)
+        sql = f"""
+SELECT json_build_object(
+    'state', (
+        SELECT json_build_object(
+            'block_hash', block_hash,
+            'block_height', block_height,
+            'parent_hash', parent_hash,
+            'chain_state', chain_state,
+            'maturity_state', maturity_state
+        )
+        FROM qbit_pool_blocks
+        WHERE block_hash = {self._text_literal(block_hash)}
+    )
+);
+"""
+        with self._operation_gate(self._lock, "writer lock"):
+            result = self._run_retry_safe_read_json(sql)
+        if not isinstance(result, dict):
+            raise RuntimeError("pool block state query returned non-object JSON")
+        state = result.get("state")
+        if state is None:
+            return None
+        if not isinstance(state, dict):
+            raise RuntimeError("pool block state query returned non-object JSON")
+        state["block_height"] = int(state["block_height"])
+        return state
+
     def reorg_watch_blocks(self, *, active_tip_height: int) -> list[dict[str, object]]:
         sql = f"""
 SELECT COALESCE(json_agg(json_build_object(
@@ -4867,8 +7209,8 @@ WHERE chain_state IN ('confirmed', 'inactive')
   AND maturity_state = 'immature'
 ;
 """
-        with self._lock:
-            rows = self._run_json(sql)
+        with self._operation_gate(self._lock, "writer lock"):
+            rows = self._run_retry_safe_read_json(sql)
         for row in rows:
             row["block_height"] = int(row["block_height"])
         return rows
@@ -4949,22 +7291,59 @@ END;
 
     def __len__(self) -> int:
         sql = "SELECT json_build_object('count', count(*)) FROM qbit_share_ledger WHERE accepted;"
-        with self._lock:
-            return int(self._run_json(sql)["count"])
+        with self._operation_gate(self._lock, "writer lock"):
+            return int(self._run_retry_safe_read_json(sql)["count"])
 
     def _run_fenced_json(self, sql: str) -> Any:
-        with self._lock:
+        with self._operation_gate(self._lock, "writer lock"):
             return self._run_json(sql)
 
     def _run_read_json(self, sql: str) -> Any:
-        with self._read_semaphore:
-            return self._run_json(sql)
+        with self._operation_gate(self._read_semaphore, "read slot"):
+            return self._run_retry_safe_read_json(sql)
+
+    def _run_retry_safe_read_json(self, sql: str) -> Any:
+        native = getattr(self, "_native", None)
+        if native is not None:
+            timeout_seconds = self._remaining_operation_timeout()
+            if timeout_seconds is None:
+                return native.run_json(sql, retry_safe=True)
+            return native.run_json(
+                sql,
+                retry_safe=True,
+                timeout_seconds=timeout_seconds,
+            )
+        return self._run_json(sql)
 
     def _ensure_writer_lease(self) -> None:
         while True:
+            acquire_started_monotonic = time.monotonic()
             result = self._try_acquire_writer_lease()
             if result.get("acquired"):
+                self._writer_lease_last_refresh_monotonic = (
+                    acquire_started_monotonic
+                )
                 return
+            if self._can_adopt_writer_lease(result):
+                observed_session = str(result["writer_session_token"])
+                adoption_started_monotonic = time.monotonic()
+                adoption = self._try_adopt_writer_lease(result)
+                if adoption.get("acquired"):
+                    self._writer_lease_last_refresh_monotonic = (
+                        adoption_started_monotonic
+                    )
+                    print(
+                        "prism ledger writer lease adopted from same-identity "
+                        f"predecessor session={observed_session}",
+                        flush=True,
+                    )
+                    return
+                # A CAS loss may mean the predecessor renewed concurrently or
+                # another replacement won. Re-observe the returned owner and
+                # require a fresh full silence interval before another CAS;
+                # permanently refusing this token would recreate the TTL
+                # outage if that renewal were its final act before dying.
+                result = adoption
             if not self._can_wait_for_writer_lease(result):
                 raise RuntimeError(
                     "qbit ledger writer lease is held by "
@@ -4973,6 +7352,9 @@ END;
                     f"until {result.get('lease_expires_at')}"
                 )
             wait_seconds = max(0.0, float(result.get("lease_wait_seconds") or 0.0))
+            adoption_wait_seconds = self._writer_lease_adoption_wait_seconds(result)
+            if adoption_wait_seconds is not None:
+                wait_seconds = min(wait_seconds, adoption_wait_seconds)
             sleep_seconds = min(
                 self._lease_retry_max_sleep_seconds,
                 max(self._lease_retry_min_sleep_seconds, wait_seconds),
@@ -5042,6 +7424,11 @@ SELECT COALESCE(
             'writer_epoch', writer_epoch,
             'writer_session_token', writer_session_token,
             'lease_expires_at', lease_expires_at::text,
+            'lease_updated_at', updated_at::text,
+            'lease_age_seconds', GREATEST(
+                0,
+                EXTRACT(EPOCH FROM (clock_timestamp() - updated_at))
+            ),
             'lease_wait_seconds', GREATEST(
                 0,
                 EXTRACT(EPOCH FROM (lease_expires_at - clock_timestamp()))
@@ -5057,6 +7444,147 @@ SELECT COALESCE(
             raise RuntimeError("psql writer lease query returned non-object JSON")
         return result
 
+    def _can_adopt_writer_lease(self, result: dict[str, Any]) -> bool:
+        wait_seconds = self._writer_lease_adoption_wait_seconds(result)
+        return wait_seconds is not None and wait_seconds <= 0
+
+    def _writer_lease_adoption_wait_seconds(
+        self,
+        result: dict[str, Any],
+    ) -> float | None:
+        """Return time until one heartbeat-capable predecessor is adoptable.
+
+        A timestamp CAS alone only orders database mutations; it does not prove
+        that a live, idle predecessor cannot still perform an external wallet
+        or node RPC before its next fenced write. Fast adoption is therefore
+        restricted to coordinator sessions guarded by the same writer/epoch
+        PostgreSQL advisory lock. This process cannot reach this method until
+        that predecessor's guard session is gone. PostgreSQL must additionally
+        report the exact session unchanged for a full silence interval before
+        the CAS, giving a holder whose guard connection failed time to self-exit.
+        A renewing live twin retains the guard and cannot reach lease polling.
+
+        The silence interval is measured from two independent edges and the
+        later one wins. The row edge (``updated_at`` age) alone is unsafe: a
+        long fenced transaction such as ``persist_accepted_block`` withholds
+        the predecessor's ``updated_at`` refresh until commit, so the row can
+        already look minutes silent the instant the predecessor dies. The
+        guard edge therefore requires a full interval to elapse after *this*
+        process acquired the advisory guard, guaranteeing the predecessor its
+        whole heartbeat failure budget to self-fence after losing the guard,
+        no matter how stale the row already is.
+        """
+        observed_session = result.get("writer_session_token")
+        if not (
+            self.writer_lease_fast_adoption_capable
+            and self._can_wait_for_writer_lease(result)
+            and isinstance(observed_session, str)
+            and observed_session.startswith(WRITER_LEASE_HEARTBEAT_SESSION_PREFIX)
+            and observed_session != self._writer_session_token
+            and result.get("lease_updated_at") is not None
+        ):
+            return None
+        guard_acquired_monotonic = getattr(
+            self,
+            "_writer_lease_guard_acquired_monotonic",
+            None,
+        )
+        if guard_acquired_monotonic is None:
+            return None
+        try:
+            age_seconds = float(result.get("lease_age_seconds"))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(age_seconds) or age_seconds < 0:
+            return None
+        row_wait_seconds = max(
+            0.0,
+            self._lease_adoption_silence_seconds - age_seconds,
+        )
+        guard_held_seconds = max(
+            0.0,
+            time.monotonic() - guard_acquired_monotonic,
+        )
+        guard_wait_seconds = max(
+            0.0,
+            self._lease_adoption_silence_seconds - guard_held_seconds,
+        )
+        return max(row_wait_seconds, guard_wait_seconds)
+
+    def _try_adopt_writer_lease(self, observed: dict[str, Any]) -> dict[str, Any]:
+        """Fence and replace one observed same-identity predecessor session.
+
+        The caller first proves the heartbeat-capable predecessor has been
+        silent for the configured interval. PostgreSQL row-lock ordering then
+        makes this compare-and-swap the final database fence: a predecessor
+        renewal that wins first changes ``updated_at`` and makes this update
+        affect zero rows; if this update wins first, every later predecessor
+        mutation sees a different session and is fenced out.
+        """
+        payload = {
+            "writer_id": self._writer_id,
+            "writer_epoch": self._writer_epoch,
+            "writer_session_token": self._writer_session_token,
+            "observed_writer_session_token": observed.get("writer_session_token"),
+            "observed_lease_updated_at": observed.get("lease_updated_at"),
+        }
+        sql = f"""
+WITH payload AS (
+    SELECT {self._jsonb_literal(payload)} AS data
+),
+adopted AS (
+    UPDATE qbit_ledger_writer_lease
+    SET writer_session_token = data->>'writer_session_token',
+        lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM payload
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = data->>'observed_writer_session_token'
+      AND qbit_ledger_writer_lease.updated_at = (data->>'observed_lease_updated_at')::timestamptz
+      AND qbit_ledger_writer_lease.lease_expires_at > clock_timestamp()
+    RETURNING writer_id, writer_epoch, writer_session_token
+)
+SELECT COALESCE(
+    (
+        SELECT json_build_object(
+            'acquired', true,
+            'adopted', true,
+            'writer_id', writer_id,
+            'writer_epoch', writer_epoch,
+            'writer_session_token', writer_session_token
+        )
+        FROM adopted
+    ),
+    (
+        SELECT json_build_object(
+            'acquired', false,
+            'adopted', false,
+            'writer_id', writer_id,
+            'writer_epoch', writer_epoch,
+            'writer_session_token', writer_session_token,
+            'lease_expires_at', lease_expires_at::text,
+            'lease_updated_at', updated_at::text,
+            'lease_age_seconds', GREATEST(
+                0,
+                EXTRACT(EPOCH FROM (clock_timestamp() - updated_at))
+            ),
+            'lease_wait_seconds', GREATEST(
+                0,
+                EXTRACT(EPOCH FROM (lease_expires_at - clock_timestamp()))
+            )
+        )
+        FROM qbit_ledger_writer_lease
+        WHERE singleton
+    )
+);
+"""
+        result = self._run_json(sql)
+        if not isinstance(result, dict):
+            raise RuntimeError("psql writer lease adoption query returned non-object JSON")
+        return result
+
     def _can_wait_for_writer_lease(self, result: dict[str, Any]) -> bool:
         try:
             holder_epoch = int(result.get("writer_epoch"))
@@ -5068,9 +7596,397 @@ SELECT COALESCE(
             and result.get("lease_expires_at") is not None
         )
 
+    def renew_writer_lease(self) -> dict[str, int | str]:
+        """Refresh this writer's lease without touching any ledger rows.
+
+        The lease is normally refreshed as a side effect of every fenced
+        write. A daemon pass that produced no writes calls this instead, so an
+        otherwise-idle writer's lease does not sit expired. Raises when the
+        exact ``(writer_id, writer_epoch, writer_session_token)`` no longer
+        holds the lease, matching the fenced-write failure mode so a fenced-out
+        writer still fails fast.
+        """
+        return self._renew_writer_lease_with(self._run_fenced_json)
+
+    def verify_writer_lease_guard_session(
+        self,
+        *,
+        on_query_start: Callable[[], None] | None = None,
+        on_statement_progress: Callable[[], None] | None = None,
+    ) -> dict[str, int | str]:
+        """Prove the guard session live; renew the TTL only without waiting.
+
+        The coordinator's periodic heartbeat and its external-side-effect
+        fence both run this on the dedicated guard connection. It must never
+        wait on the ``qbit_ledger_writer_lease`` tuple lock: every fenced
+        write (share appends, ``persist_accepted_block``) row-locks that
+        tuple for its whole transaction, and a guarded statement queued
+        behind it hits the guard's statement timeout and hard-exits a
+        healthy coordinator. Liveness is therefore proven by non-blocking
+        reads: the session answers, PostgreSQL still shows this backend
+        holding the writer advisory lock, and the last committed lease row
+        still names this exact session. Guard-connection loss or a
+        fenced-out session raises, which callers treat as loss of the
+        guarded session.
+
+        The lease TTL still needs a writer-side refresh, or an idle
+        coordinator (no fenced writes, CTV broadcaster disabled) would let
+        ``lease_expires_at`` lapse and any different-identity claimant could
+        seize the singleton row through its expiry CAS — that identity uses
+        a different advisory-lock key, so this process's guard would not
+        block it. The same statement therefore renews the exact-identity
+        lease row with ``FOR NO KEY UPDATE SKIP LOCKED``: renewal happens on
+        every heartbeat while the tuple is uncontended and is skipped
+        without queueing while a fenced transaction holds it (that
+        transaction refreshes the TTL itself when it commits).
+
+        A skipped renewal is only trustworthy while the committed row is
+        unexpired. Once ``lease_expires_at`` has lapsed, a lock we skipped
+        may be a different-identity ``_try_acquire_writer_lease`` taking the
+        row through its expiry CAS, and the stale committed snapshot would
+        still name this session until that claim commits. The locking
+        renewal used to catch exactly this by queueing and re-evaluating
+        after the claimant committed; the non-blocking spelling recovers it
+        by failing closed whenever the renewal was lock-blocked and the
+        committed row was already expired.
+
+        The one lock-blocked expired case that must not fail closed is this
+        coordinator's own fenced write outlasting the TTL (a slow
+        ``persist_accepted_block``): it holds the tuple's exclusive lock, so
+        no expiry claim can be in flight behind it, and its commit refreshes
+        ``lease_expires_at`` before any queued claimant re-evaluates its
+        expiry CAS — raising would roll back a valid write and restart-loop
+        on every similarly slow block. The statement therefore attributes
+        the committed row's locker through ``pg_stat_activity``: the row's
+        ``xmax`` is the locker's transaction id, and a backend running that
+        transaction under this process's unique pool ``application_name``
+        is this writer's own fenced write. Only an expired row locked by
+        anyone else raises.
+
+        That attribution can misfire in one direction: the statement's
+        lease-row reads all share one MVCC snapshot, while
+        ``pg_stat_activity`` reports live backend state. An own fenced
+        write committing between the snapshot and the probe clears its
+        backend's ``backend_xid`` while the snapshot still shows the
+        expired row that write locked, so the probe reports no own locker
+        for a renewal that in fact just landed. A would-be fail-closed is
+        therefore re-verified once on a fresh statement: its new snapshot
+        sees the committed refresh (the renewal lands normally), a
+        completed takeover (the exact-identity match fails closed), or the
+        same contended expiry (still fails closed). One recheck is enough
+        — each further miss needs another independent commit to land
+        inside the next statement's snapshot-to-probe window, and every
+        residual outcome remains fail-closed. The recheck executes inside
+        the guard's already-held serialized query slot, so it cannot queue
+        behind other guard callers; it adds at most one more non-blocking
+        statement to this verification's execution.
+
+        That tolerance proves liveness only, not authority to act outside
+        the database: the survival argument assumes the fenced write
+        commits, and a rollback instead releases the expired row unchanged,
+        letting a queued different-identity claimant take it immediately.
+        The result therefore reports ``renewal_deferred_to_own_write`` for
+        this state, and external-side-effect fences must withhold the
+        guarded RPC while it is set, retrying on their own cadence until a
+        verification lands a renewal (the write committed, refreshing the
+        TTL) or fails closed. The heartbeat may keep treating it as live.
+
+        The deferral engages before expiry as well: an own-write skip over
+        a committed row with less than the authority margin remaining also
+        defers. An RPC authorized on a nearly-lapsed row can outlive it,
+        and from expiry onward its authority degenerates into the same
+        rollback-dependent argument — the TTL erodes exactly while a long
+        own write withholds renewals, so the runway shrinks precisely when
+        the write's fate is least certain. The margin is never below half
+        the lease TTL and is raised by the coordinator to cover its
+        longest fence-guarded RPC deadline plus fixed headroom (see
+        ``_resolve_lease_authority_margin_seconds``), so every authorized
+        effect's transmission deadline — and, within the headroom, the
+        node's application of a fully received request — lands inside the
+        committed row's remaining validity. A node that stalls longer
+        than the headroom after complete receipt is the documented
+        residual of preflight fencing between independent systems; no
+        client-side deadline can cancel a handler the node already
+        received.
+        Skips over a row with at least the margin remaining keep
+        authorizing on the committed row's own standalone validity: every
+        fenced commit refreshes the TTL, so steady write traffic never
+        erodes the runway, and deferring every own-write skip would
+        withhold submitblock and broadcasts behind saturated append
+        traffic — the submitter liveness the fast-lane submit path exists
+        to protect.
+
+        ``on_query_start`` fires once the guarded session's serialized query
+        slot is acquired, letting callers budget queue wait separately from
+        statement execution. The attribution recheck happens within that
+        one slot acquisition, so it neither re-fires the callback nor adds
+        a queue wait to the caller's execution budget.
+
+        ``on_statement_progress`` fires when the recheck decides to run a
+        second statement: the first statement's full round trip has
+        completed, which is exactly the session-answers evidence a
+        liveness monitor watches for. Callers whose staleness budgets are
+        sized for one statement (the heartbeat monitor's failure window)
+        stamp progress here so a lawful two-statement verification is not
+        mistaken for a wedged heartbeat, while a genuinely stuck statement
+        still produces no progress at all.
+        """
+        if not self.writer_lease_fast_adoption_capable:
+            raise RuntimeError("writer session is not heartbeat-capable")
+        guard = self._writer_lease_guard
+        if guard is None:
+            raise RuntimeError("postgres writer lease guard is not held")
+        payload = {
+            "writer_id": self._writer_id,
+            "writer_epoch": self._writer_epoch,
+            "writer_session_token": self._writer_session_token,
+            "pool_application_name": self._pool_application_name,
+        }
+        lock_key = _writer_lease_advisory_lock_key(
+            self._writer_id,
+            self._writer_epoch,
+        )
+        # pg_locks splits a 64-bit advisory key into classid (high word) and
+        # objid (low word) with objsubid = 1.
+        lock_classid = (lock_key >> 32) & 0xFFFFFFFF
+        lock_objid = lock_key & 0xFFFFFFFF
+        sql = f"""
+WITH payload AS (
+    SELECT {self._jsonb_literal(payload)} AS data
+),
+renewable AS (
+    SELECT qbit_ledger_writer_lease.singleton
+    FROM qbit_ledger_writer_lease, payload
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+    FOR NO KEY UPDATE SKIP LOCKED
+),
+renewed AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM renewable
+    WHERE qbit_ledger_writer_lease.singleton = renewable.singleton
+    RETURNING qbit_ledger_writer_lease.writer_id
+)
+SELECT json_build_object(
+    'backend', 'postgres-psql',
+    'guard_advisory_lock_held', EXISTS (
+        SELECT 1
+        FROM pg_locks
+        WHERE locktype = 'advisory'
+          AND granted
+          AND pid = pg_backend_pid()
+          AND classid = {lock_classid}::oid
+          AND objid = {lock_objid}::oid
+          AND objsubid = 1
+    ),
+    'writer_session_token_current', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+          AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+          AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+    ),
+    'lease_renewed_count', (SELECT count(*) FROM renewed),
+    'lease_expired', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+          AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+          AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+          AND qbit_ledger_writer_lease.lease_expires_at <= clock_timestamp()
+    ),
+    'lease_expiring_within_authority_margin', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+          AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+          AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+          AND qbit_ledger_writer_lease.lease_expires_at
+              <= clock_timestamp() + {self._lease_authority_margin_sql}
+    ),
+    'lease_locked_by_this_process', EXISTS (
+        SELECT 1
+        FROM qbit_ledger_writer_lease, pg_stat_activity, payload
+        WHERE qbit_ledger_writer_lease.singleton
+          AND pg_stat_activity.application_name = data->>'pool_application_name'
+          AND pg_stat_activity.backend_xid IS NOT NULL
+          AND pg_stat_activity.backend_xid = qbit_ledger_writer_lease.xmax
+    )
+);
+"""
+        attribution_rechecks_left = WRITER_LEASE_VERIFICATION_MAX_STATEMENTS - 1
+
+        def attribution_recheck(result: Any) -> str | None:
+            # Runs inside the guard's held query slot, between statements.
+            # The locker probe reads live pg_stat_activity state against
+            # its statement's older row snapshot, so an own fenced write
+            # committing mid-statement leaves an expired locked row with
+            # no attributable locker — the same shape as a competing
+            # claim. The next statement's fresh snapshot resolves which
+            # one it was; only the ambiguous shape earns the recheck, and
+            # every recheck outcome that is not a landed renewal still
+            # fails closed below.
+            nonlocal attribution_rechecks_left
+            if attribution_rechecks_left and (
+                self._lease_renewal_ambiguously_lock_blocked(result)
+            ):
+                attribution_rechecks_left -= 1
+                if on_statement_progress is not None:
+                    # The first statement's round trip just completed;
+                    # liveness monitors must count it before the second
+                    # statement's execution starts consuming their budget.
+                    on_statement_progress()
+                return sql
+            return None
+
+        if on_query_start is None:
+            result = guard.run_json(sql, followup=attribution_recheck)
+        else:
+            result = guard.run_json(
+                sql,
+                on_query_start=on_query_start,
+                followup=attribution_recheck,
+            )
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "psql writer lease guard verification returned non-object JSON"
+            )
+        if not result.get("guard_advisory_lock_held"):
+            raise RuntimeError(
+                "postgres writer lease guard advisory lock is no longer held"
+            )
+        if not result.get("writer_session_token_current"):
+            raise RuntimeError("writer lease is not active")
+        try:
+            renewed_count = int(result.get("lease_renewed_count", 0))
+        except (TypeError, ValueError):
+            renewed_count = 0
+        renewal_deferred_to_own_write = bool(
+            renewed_count == 0
+            and result.get("lease_locked_by_this_process")
+            and (
+                result.get("lease_expired")
+                or result.get("lease_expiring_within_authority_margin")
+            )
+        )
+        if (
+            renewed_count == 0
+            and result.get("lease_expired")
+            and not renewal_deferred_to_own_write
+        ):
+            # The committed row still names this session but its TTL has
+            # lapsed and the tuple lock we declined to wait on may belong to
+            # a different-identity expiry claim whose commit would land right
+            # after this snapshot. A stale token read is not proof of
+            # liveness here; fail closed like the queueing renewal used to.
+            # The exemption is the writer's own fenced write outlasting the
+            # TTL: its exclusive tuple lock means no claim is in flight, and
+            # its commit refreshes the TTL before any queued claimant
+            # re-evaluates its expiry CAS, so the session provably survives.
+            # It survives as a *process*; the returned deferral flag tells
+            # external-side-effect fences the same state is not authority
+            # for a guarded RPC, because a rollback would hand the expired
+            # row to a queued claimant instead.
+            raise RuntimeError(
+                "writer lease is expired and its renewal was lock-blocked; "
+                "a competing expiry claim may be in flight"
+            )
+        return {
+            "backend": str(result["backend"]),
+            "verified_count": 1,
+            "renewed_count": renewed_count,
+            "renewal_deferred_to_own_write": renewal_deferred_to_own_write,
+        }
+
+    @staticmethod
+    def _lease_renewal_ambiguously_lock_blocked(result: Any) -> bool:
+        """The expired, lock-blocked, unattributable-locker result shape.
+
+        This is the only shape whose meaning a single statement cannot
+        decide: a competing expiry claim and an own fenced write that
+        committed mid-statement both present it. Identity failures are
+        excluded — a lost advisory lock or session token is conclusive and
+        must surface through the ordinary raises, never a recheck.
+        """
+        if not isinstance(result, dict):
+            return False
+        if not result.get("guard_advisory_lock_held"):
+            return False
+        if not result.get("writer_session_token_current"):
+            return False
+        try:
+            renewed_count = int(result.get("lease_renewed_count", 0))
+        except (TypeError, ValueError):
+            renewed_count = 0
+        return bool(
+            renewed_count == 0
+            and result.get("lease_expired")
+            and not result.get("lease_locked_by_this_process")
+        )
+
+    def _renew_writer_lease_with(
+        self,
+        run_json: Callable[[str], Any],
+    ) -> dict[str, int | str]:
+        payload = {
+            "writer_id": self._writer_id,
+            "writer_epoch": self._writer_epoch,
+            "writer_session_token": self._writer_session_token,
+        }
+        sql = f"""
+WITH payload AS (
+    SELECT {self._jsonb_literal(payload)} AS data
+),
+lease AS (
+    UPDATE qbit_ledger_writer_lease
+    SET lease_expires_at = clock_timestamp() + {self._lease_interval_sql},
+        updated_at = clock_timestamp()
+    FROM payload
+    WHERE qbit_ledger_writer_lease.singleton
+      AND qbit_ledger_writer_lease.writer_id = data->>'writer_id'
+      AND qbit_ledger_writer_lease.writer_epoch = (data->>'writer_epoch')::bigint
+      AND qbit_ledger_writer_lease.writer_session_token = data->>'writer_session_token'
+    RETURNING qbit_ledger_writer_lease.writer_id
+)
+SELECT CASE
+    WHEN (SELECT count(*) FROM lease) = 0 THEN
+        json_build_object('error', 'writer lease is not active')
+    ELSE
+        json_build_object(
+            'backend', 'postgres-psql',
+            'renewed_count', (SELECT count(*) FROM lease)
+        )
+END;
+"""
+        result = run_json(sql)
+        if not isinstance(result, dict):
+            raise RuntimeError("psql writer lease renewal returned non-object JSON")
+        if "error" in result:
+            raise RuntimeError(str(result["error"]))
+        return {"backend": str(result["backend"]), "renewed_count": int(result["renewed_count"])}
+
     def release_writer_lease(self) -> bool:
-        """Expire this writer's lease so a same-identity replacement can take
-        over immediately instead of waiting out the lease TTL.
+        """Expire this writer's lease through the normal fenced DB path."""
+        return self._release_writer_lease_with(self._run_fenced_json)
+
+    def release_writer_lease_fresh_connection(self) -> bool:
+        """Expire this writer's lease through a one-shot psql connection.
+
+        The watchdog uses this path because its shared ledger lock or native
+        connection pool may be held by the subsystem that stopped making
+        progress. ``_run_sql`` forks psql without touching either resource.
+        """
+        return self._release_writer_lease_with(self._run_fresh_connection_json)
+
+    def _release_writer_lease_with(self, run_json: Callable[[str], Any]) -> bool:
+        """Run the one exact-session release implementation with ``run_json``.
 
         Best-effort, intended for graceful shutdown. Only the exact
         ``(writer_id, writer_epoch, writer_session_token)`` this process holds is
@@ -5099,16 +8015,41 @@ released AS (
 )
 SELECT json_build_object('released', (SELECT count(*) FROM released));
 """
-        result = self._run_fenced_json(sql)
-        if not isinstance(result, dict):
-            raise RuntimeError("psql writer lease release returned non-object JSON")
-        return int(result.get("released", 0)) > 0
+        try:
+            result = run_json(sql)
+            if not isinstance(result, dict):
+                raise RuntimeError("psql writer lease release returned non-object JSON")
+            return int(result.get("released", 0)) > 0
+        finally:
+            # The owning coordinator calls release only after writer admission
+            # and the lease heartbeat are stopped. Releasing this session lock
+            # is the final handoff that lets a successor enter fast adoption.
+            self._close_writer_lease_guard()
 
-    def _run_json(self, sql: str) -> Any:
+    def _run_fresh_connection_json(self, sql: str) -> Any:
         output = self._run_sql(sql).strip()
         if not output:
             raise RuntimeError("psql query returned no JSON")
         return json.loads(output.splitlines()[-1])
+
+    def _run_json(self, sql: str) -> Any:
+        native = getattr(self, "_native", None)
+        if native is not None:
+            timeout_seconds = self._remaining_operation_timeout()
+            if timeout_seconds is None:
+                return native.run_json(sql)
+            return native.run_json(sql, timeout_seconds=timeout_seconds)
+        output = self._run_sql(sql).strip()
+        if not output:
+            raise RuntimeError("psql query returned no JSON")
+        return json.loads(output.splitlines()[-1])
+
+    def _run_script(self, sql: str) -> None:
+        native = getattr(self, "_native", None)
+        if native is not None:
+            native.run_script(sql)
+            return
+        self._run_sql(sql)
 
     def _run_sql(self, sql: str) -> str:
         cmd = [
@@ -5116,22 +8057,55 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             "--no-psqlrc",
             "--set",
             "ON_ERROR_STOP=1",
+            "--set",
+            "VERBOSITY=verbose",
             "--tuples-only",
             "--no-align",
             "--quiet",
         ]
-        completed = subprocess.run(
-            cmd,
-            input=sql,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+        timeout_seconds = self._remaining_operation_timeout()
+        run_kwargs: dict[str, Any] = {}
+        if timeout_seconds is not None:
+            timeout_ms = max(1, int(timeout_seconds * 1000))
+            subprocess_env = dict(os.environ)
+            existing_options = subprocess_env.get("PGOPTIONS", "").strip()
+            timeout_options = (
+                f"-c statement_timeout={timeout_ms}ms "
+                f"-c lock_timeout={timeout_ms}ms"
+            )
+            subprocess_env["PGOPTIONS"] = " ".join(
+                option for option in (existing_options, timeout_options) if option
+            )
+            subprocess_env["PGCONNECT_TIMEOUT"] = str(
+                max(1, math.ceil(timeout_seconds))
+            )
+            run_kwargs = {
+                "env": subprocess_env,
+                "timeout": timeout_seconds,
+            }
+        try:
+            completed = subprocess.run(
+                cmd,
+                input=sql,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                **run_kwargs,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise LedgerOperationTimeout(
+                f"psql operation exceeded {timeout_seconds:g}s"
+            ) from exc
         if completed.returncode != 0:
+            stderr = completed.stderr.strip()
+            if timeout_seconds is not None and _is_postgres_deadline_error(stderr):
+                raise LedgerOperationTimeout(
+                    f"psql operation exceeded {timeout_seconds:g}s"
+                )
             raise RuntimeError(
                 "psql command failed "
-                f"(exit {completed.returncode}): {completed.stderr.strip()}"
+                f"(exit {completed.returncode}): {stderr}"
             )
         return completed.stdout
 
@@ -5153,6 +8127,12 @@ SELECT json_build_object('released', (SELECT count(*) FROM released));
             credit_policy=(
                 str(payload["credit_policy"])
                 if payload.get("credit_policy") is not None
+                else None
+            ),
+            newly_inserted=bool(payload.get("newly_inserted", True)),
+            candidate_outbox_state=(
+                str(payload["candidate_outbox_state"])
+                if payload.get("candidate_outbox_state") is not None
                 else None
             ),
         )

@@ -337,7 +337,103 @@ Production requires `PRISM_STRATUM_STALE_GRACE_SECONDS=0` until every published
 audit consumer has demonstrated compatibility with stale-grace receipts.
 `PRISM_TEMPLATE_REFRESH_FAILURE_EXIT_SECONDS` similarly bounds a persistent
 PRISM template-refresh outage; it must be shorter than the operator alert and
-response window.
+response window. Coordination-only refresh deferrals remain outside that
+ordinary failure budget, but only for
+`PRISM_COORDINATION_BLOCKED_EXIT_SECONDS` (default 900 seconds). A continuous
+streak beyond that separate bound fires the publication-progress watchdog and
+restarts the coordinator. Alert on
+`qbit_prism_template_refresh_coordination_blocked_age_seconds` before it
+approaches the configured bound.
+
+`PRISM_TIP_REFRESH_EPOCH_FANOUT` is a staged rollout gate and defaults to `0`.
+Leave it disabled for legacy refresh behavior. Enable it deliberately to make
+each refresh wave converge on the latest observed tip epoch; payout and trust
+publication fences remain authoritative. Monitor refresh-wave outcomes and
+delivery coverage during rollout, and return the setting to `0` to roll back.
+
+PRISM's fast same-identity restart path requires the default native PostgreSQL
+client (`PRISM_POSTGRES_NATIVE_CLIENT=auto` or `1`). Each coordinator holds a
+dedicated PostgreSQL advisory guard for its writer ID and epoch and
+periodically proves that isolated session live with a non-blocking check (the
+session answers, still holds the advisory lock, and the committed lease row
+still names it). The heartbeat never waits on the lease tuple's row lock:
+fenced writes hold it for entire transactions, and accepted-block persistence
+can legitimately exceed the guard's statement timeout. It renews the lease TTL
+only while that tuple is uncontended (`SKIP LOCKED`), so an idle coordinator —
+no fenced writes and the CTV broadcaster disabled — still keeps its lease from
+expiring under a different writer identity's expiry claim. If the committed row
+is already expired and the renewal was lock-blocked, verification fails closed:
+the skipped lock may be an in-flight expiry claim, and a stale committed token
+read is not proof of liveness. The one exemption is a lock `pg_stat_activity`
+attributes to this coordinator's own pooled backends — a fenced write
+outlasting the TTL — because its exclusive tuple lock means no claim can be in
+flight and its commit refreshes the lease before any queued claimant
+re-evaluates its expiry CAS; hard-exiting there would roll back a valid write
+and restart-loop on every similarly slow block. That exemption keeps only the
+heartbeat alive: it assumes the write commits, so the external-side-effect
+fence refuses guarded RPCs (without fencing the process) while renewal is
+deferred behind the writer's own write — a rollback would hand the expired row
+to a queued claimant — and broadcast passes or candidate-outbox replays simply
+retry once the commit lands a renewal. A
+replacement must acquire the guard and then wait one full silence interval
+measured both from the lease row's last update and from its own guard
+acquisition before its exact-session CAS, so a predecessor that just lost its
+guard always has time to self-fence even when a long transaction left its
+lease row looking stale. This prevents a live or paused twin from being fenced
+merely because it is idle. A psql-only deployment cannot retain a session
+guard, logs that fast adoption is disabled, and conservatively falls back to
+the configured lease TTL. Keep generated session tokens in production; fixed
+tokens remain a local test-only facility.
+
+Before each mutating qbitd or wallet RPC, the coordinator performs the same
+bounded non-blocking exact-session verification on that advisory-guard
+connection, so the fence never contends with an in-flight accepted-block
+transaction on the lease tuple. This makes a lost
+session or a host suspend/resume fail closed before the usual RPC path. It is a
+preflight fence, not an atomic transaction across PostgreSQL and qbitd: a
+process paused after verification and resumed after its database session was
+lost could still reach the independent RPC target. Mutating RPCs do not use the
+JSON-RPC client's transparent transport retry; durable block/CTV retry starts a
+new fenced operation instead. Broadcast and block-submit RPCs deduplicate
+identical payloads, which limits the effect, but separately built CTV fee
+children can still conflict. Operators must not manually start a replacement
+with the same writer identity when predecessor termination is uncertain,
+especially during a PostgreSQL restart or network partition. Strict elimination
+of that residual window requires qbitd/wallet RPCs to validate a fencing
+generation supplied by the coordinator.
+
+### PRISM Watchdog Exit Forensics
+
+The PRISM image has no entrypoint or init wrapper: its exec-form Dockerfile
+command starts `python3 -m lab.prism.prism_coordinator` directly as container
+PID 1, and neither Compose file overrides that command. Consequently a
+watchdog `os._exit(1)` is delivered to Docker as status 1; there is no
+repository wrapper that can translate it to zero. The development profile's
+`restart: on-failure` depends on that status, while the production override's
+`restart: unless-stopped` restarts unexpected status-0 and status-1 exits.
+
+Do not use a post-restart `.State.ExitCode` value as the prior watchdog exit
+status. `docker inspect` exposes the container's current execution state, not
+an invocation history, and can show zero after the replacement process is
+already running. Capture the daemon's `die` event for the failing invocation
+instead, and retain it with the incident record:
+
+```sh
+docker events \
+  --since '<incident-start-rfc3339>' \
+  --until '<incident-end-rfc3339>' \
+  --filter type=container \
+  --filter container='<prism-container-name-or-id>' \
+  --filter event=die \
+  --format '{{json .Actor.Attributes}}'
+```
+
+The event attributes contain the invocation's `exitCode`. The hard-exit path
+does not flush stdout/stderr before arming termination because a full container
+log pipe could otherwise suppress the watchdog itself. If no historical `die`
+event was retained, a later running-state `ExitCode=0` cannot establish the
+prior invocation's status; record the discrepancy as missing event-time
+evidence.
 
 ### CTV At Genesis
 

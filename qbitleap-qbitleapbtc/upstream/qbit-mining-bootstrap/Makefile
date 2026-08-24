@@ -59,7 +59,7 @@ compose_env_value() { \
 	};
 endef
 
-.PHONY: doctor prism-self-check require-lab-mode test-builder test-builder-regtest test-prism-regtest test-prism-postgres-ledger test-prism-postgres-throughput test-prism-stratum-regtest-live test-prism-stratum-postgres-regtest-live test-prism-combined-regtest test-compose-prism-config up up-permissionless up-permissionless-pool test-permissionless test-permissionless-p2mr test-ckpool-bip310 up-real-miner up-permissionless-real test-real-miner up-auxpow up-auxpow-bridge up-auxpow-pool up-prism up-prism-pool up-dual-pools test-auxpow test-auxpow-stratum test-auxpow-stratum-bip310 test-auxpow-stratum-age smoke-all down purge-local-volumes
+.PHONY: doctor prism-self-check require-lab-mode test-builder test-builder-regtest test-prism-regtest test-prism-postgres-ledger test-prism-postgres-scale test-prism-postgres-native-ledger test-prism-postgres-throughput test-prism-stratum-regtest-live test-prism-stratum-postgres-regtest-live test-prism-combined-regtest test-compose-prism-config up up-permissionless up-permissionless-pool test-permissionless test-permissionless-p2mr test-ckpool-bip310 up-real-miner up-permissionless-real test-real-miner up-auxpow up-auxpow-bridge up-auxpow-pool up-prism up-prism-pool up-dual-pools test-auxpow test-auxpow-stratum test-auxpow-stratum-bip310 test-auxpow-stratum-age smoke-all down purge-local-volumes
 
 require-lab-mode:
 	@bash scripts/check-env.sh --require-lab
@@ -93,6 +93,12 @@ test-prism-regtest:
 test-prism-postgres-ledger:
 	bash test/test-prism-postgres-ledger.sh
 
+test-prism-postgres-scale:
+	bash test/test-prism-postgres-scale.sh
+
+test-prism-postgres-native-ledger:
+	bash test/test-prism-postgres-native-ledger.sh
+
 test-prism-postgres-throughput:
 	bash test/test-prism-postgres-throughput.sh
 
@@ -113,6 +119,12 @@ test-compose-prism-config:
 	PRISM_STRATUM_PORT_HOST=127.0.0.1:43340 \
 	PRISM_STRATUM_PORT=43340 \
 	$(COMPOSE) --profile prism config >/dev/null
+
+test-ckpool-rejects-observability:
+	@set -euo pipefail; \
+	bin="$$(bash scripts/build-patched-ckpool.sh)"; \
+	QBIT_CKPOOL_REJECTS_BIN="$$bin" \
+	python3 -m unittest -v tests.test_ckpool_rejects_observability
 
 up: up-dual-pools
 

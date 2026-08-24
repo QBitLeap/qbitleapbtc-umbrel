@@ -1,11 +1,75 @@
 use qbit_pool_builder::{
-    build_manifest, build_signed_manifest, verify_ed25519_message, verify_signed_manifest,
+    build_manifest, canonical_manifest_bytes, verify_ed25519_message, verify_signed_manifest,
     BuilderError, CoinbaseBuildRequest, ManifestSignature, ManifestSigningKey, PayoutManifest,
-    SignedPayoutManifest, WeightedEntitlement,
+    PinnedFirstOutput, SignedPayoutManifest, WeightedEntitlement,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::time::Instant;
+
+pub const AUDIT_BUILD_PAYOUT_DERIVATION_PHASE: &str = "payout_state_derivation";
+pub const AUDIT_BUILD_CTV_MANIFEST_PHASE: &str = "ctv_manifest_construction";
+pub const AUDIT_BUILD_COINBASE_PHASE: &str = "coinbase_bundle_construction";
+pub const AUDIT_BUILD_SIGNING_PHASE: &str = "signing_verification";
+
+thread_local! {
+    static AUDIT_BUILD_PHASE_TIMINGS: RefCell<Option<BTreeMap<&'static str, f64>>> =
+        const { RefCell::new(None) };
+}
+
+/// Profile one synchronous audit build without changing its deterministic
+/// inputs or output. The builder CLI uses this to export bounded phase metrics;
+/// ordinary library callers pay only the phase timer checks.
+pub fn profile_audit_build<T>(build: impl FnOnce() -> T) -> (T, BTreeMap<&'static str, f64>) {
+    AUDIT_BUILD_PHASE_TIMINGS.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "nested audit build profiling is unsupported"
+        );
+        *slot.borrow_mut() = Some(BTreeMap::new());
+    });
+    let result = build();
+    let timings = AUDIT_BUILD_PHASE_TIMINGS.with(|slot| {
+        slot.borrow_mut()
+            .take()
+            .expect("audit build profiling state disappeared")
+    });
+    (result, timings)
+}
+
+fn profile_audit_build_phase<T>(phase: &'static str, build: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = build();
+    let elapsed = started.elapsed().as_secs_f64();
+    AUDIT_BUILD_PHASE_TIMINGS.with(|slot| {
+        if let Some(timings) = slot.borrow_mut().as_mut() {
+            *timings.entry(phase).or_default() += elapsed;
+        }
+    });
+    result
+}
+
+fn build_profiled_signed_manifest(
+    request: CoinbaseBuildRequest,
+    signing_key: &ManifestSigningKey,
+) -> Result<SignedPayoutManifest, PrismError> {
+    let manifest =
+        profile_audit_build_phase(AUDIT_BUILD_COINBASE_PHASE, || build_manifest(request))?;
+    profile_audit_build_phase(AUDIT_BUILD_SIGNING_PHASE, || {
+        let canonical_manifest = canonical_manifest_bytes(&manifest)?;
+        Ok::<SignedPayoutManifest, BuilderError>(SignedPayoutManifest {
+            signature: ManifestSignature {
+                algorithm: "ed25519".to_string(),
+                public_key_hex: signing_key.public_key_hex(),
+                signature_hex: signing_key.sign_message_hex(&canonical_manifest),
+            },
+            manifest,
+        })
+    })
+    .map_err(PrismError::from)
+}
 
 mod ctv;
 pub use ctv::*;
@@ -46,6 +110,8 @@ pub enum PrismError {
     PoolFeeBpsTooHigh { fee_bps: u16 },
     #[error("pool fee account duplicates a miner payout account")]
     DuplicatePoolFeeAccount,
+    #[error("pool-fee-first coinbase output policy requires a configured pool fee policy")]
+    PoolFeeFirstRequiresPoolFee,
     #[error("no eligible shares at or before job issue time {anchor_job_issued_at_ms}")]
     EmptyWindow { anchor_job_issued_at_ms: i64 },
     #[error("duplicate carry-forward balance for recipient {recipient_id}")]
@@ -163,6 +229,32 @@ pub struct PayoutPolicy {
     pub min_output_sats: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_fee_policy: Option<PoolFeePolicy>,
+    /// Explicit coinbase output ordering rule. Serialized only when it departs
+    /// from the compatibility default so canonical artifacts keep their
+    /// original bytes.
+    #[serde(default, skip_serializing_if = "is_default_coinbase_output_policy")]
+    pub coinbase_output_policy: CoinbaseOutputPolicy,
+}
+
+/// Coinbase output ordering policy for settlement outputs.
+///
+/// `Canonical` keeps the historical lexicographic
+/// (order_key, recipient_id, p2mr_program_hex) ordering for every output.
+/// `PoolFeeFirst` reserves one direct settlement slot for a positive pool fee,
+/// keeps the fee out of CTV fanout chunks, and emits the fee output at
+/// coinbase vout 0 while every other output keeps canonical ordering after it.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum CoinbaseOutputPolicy {
+    #[serde(rename = "canonical")]
+    Canonical,
+    #[serde(rename = "pool-fee-first")]
+    PoolFeeFirst,
+}
+
+impl Default for CoinbaseOutputPolicy {
+    fn default() -> Self {
+        Self::Canonical
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -188,6 +280,12 @@ pub struct PayoutPolicyManifest {
     pub coinbase_value_sats: u64,
     pub min_output_sats: u64,
     pub floor_formula: String,
+    /// Coinbase output ordering rule this settlement was built under. Part of
+    /// the audit commitment leaf, so independent verifiers and indexers can
+    /// recover the intended ordering without operator-local environment
+    /// configuration. Omitted (default) means canonical ordering.
+    #[serde(default, skip_serializing_if = "is_default_coinbase_output_policy")]
+    pub coinbase_output_policy: CoinbaseOutputPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_fee: Option<PoolFeeManifest>,
     pub accounts: Vec<PayoutPolicyAccount>,
@@ -326,6 +424,8 @@ pub struct AuditVerificationReport {
     pub coinbase_wtxid: String,
     pub coinbase_tx_hex: String,
     pub min_output_sats: u64,
+    #[serde(default, skip_serializing_if = "is_default_coinbase_output_policy")]
+    pub coinbase_output_policy: CoinbaseOutputPolicy,
     pub onchain_output_count: usize,
     pub accrued_account_count: usize,
 }
@@ -369,6 +469,7 @@ impl PayoutPolicy {
             safety_multiplier: DEFAULT_MIN_OUTPUT_SAFETY_MULTIPLIER,
             min_output_sats: None,
             pool_fee_policy: None,
+            coinbase_output_policy: CoinbaseOutputPolicy::Canonical,
         }
     }
 
@@ -403,19 +504,23 @@ pub fn compute_prism_window(
     if found_block.network_difficulty == 0 {
         return Err(PrismError::ZeroNetworkDifficulty);
     }
+    let mut seen_share_ids = HashSet::with_capacity(shares.len());
+    let mut eligible = Vec::with_capacity(shares.len());
     for share in shares {
         if share.share_difficulty == 0 {
             return Err(PrismError::ZeroShareDifficulty {
                 share_seq: share.share_seq,
             });
         }
-    }
-    let mut seen_share_ids = BTreeSet::new();
-    for share in shares {
         if !seen_share_ids.insert(share.share_id.as_str()) {
             return Err(PrismError::DuplicateShareId {
                 share_id: share.share_id.clone(),
             });
+        }
+        if share.job_issued_at_ms <= found_block.anchor_job_issued_at_ms
+            && share.accepted_at_ms <= found_block.anchor_job_issued_at_ms
+        {
+            eligible.push(share);
         }
     }
 
@@ -423,14 +528,20 @@ pub fn compute_prism_window(
         .network_difficulty
         .checked_mul(PRISM_WINDOW_MULTIPLIER)
         .ok_or(PrismError::WindowOverflow)?;
-    let mut eligible = shares
-        .iter()
-        .filter(|share| {
-            share.job_issued_at_ms <= found_block.anchor_job_issued_at_ms
-                && share.accepted_at_ms <= found_block.anchor_job_issued_at_ms
-        })
-        .collect::<Vec<_>>();
-    eligible.sort_by(|left, right| right.share_seq.cmp(&left.share_seq));
+    // Production ledger snapshots are emitted in strictly ascending share
+    // sequence. Reverse that common case in O(n), while retaining the stable
+    // sort (and therefore byte-for-byte behavior) for arbitrary API callers.
+    if eligible
+        .windows(2)
+        .all(|pair| pair[0].share_seq < pair[1].share_seq)
+    {
+        eligible.reverse();
+    } else if !eligible
+        .windows(2)
+        .all(|pair| pair[0].share_seq > pair[1].share_seq)
+    {
+        eligible.sort_by(|left, right| right.share_seq.cmp(&left.share_seq));
+    }
 
     let mut remaining = requested_window_weight;
     let mut counted_shares = Vec::new();
@@ -618,6 +729,7 @@ pub fn build_prism_coinbase_request(
         witness_nonce_hex: None,
         witness_merkle_leaves_hex: Vec::new(),
         coinbase_script_sig_suffix_hex: None,
+        pinned_first_output: None,
     };
     Ok((request, window))
 }
@@ -629,6 +741,12 @@ pub fn apply_payout_policy(
 ) -> Result<PayoutPolicyManifest, PrismError> {
     let min_output_sats = policy.min_output_sats()?;
     let mut pool_fee = pool_fee_manifest(reward_manifest.coinbase_value_sats, policy)?;
+    // A configured zero-bps fee stays valid (its output only appears when dust
+    // sweeps make it positive); a missing fee policy must fail instead of
+    // committing pool-fee-first on an artifact that cannot honor it.
+    if policy.coinbase_output_policy == CoinbaseOutputPolicy::PoolFeeFirst && pool_fee.is_none() {
+        return Err(PrismError::PoolFeeFirstRequiresPoolFee);
+    }
     let fee_amount_sats = pool_fee
         .as_ref()
         .map(|manifest| manifest.amount_sats)
@@ -846,9 +964,42 @@ pub fn apply_payout_policy(
         coinbase_value_sats: reward_manifest.coinbase_value_sats,
         min_output_sats,
         floor_formula: policy.floor_formula(),
+        coinbase_output_policy: policy.coinbase_output_policy,
         pool_fee,
         accounts,
         onchain_entitlements,
+    })
+}
+
+/// The pool-fee manifest entry that must occupy coinbase vout 0, when the
+/// committed coinbase output policy demands one. Returns `None` under
+/// canonical ordering or when no positive pool-fee output exists.
+fn pool_fee_first_output(manifest: &PayoutPolicyManifest) -> Option<&PoolFeeManifest> {
+    if manifest.coinbase_output_policy != CoinbaseOutputPolicy::PoolFeeFirst {
+        return None;
+    }
+    manifest
+        .pool_fee
+        .as_ref()
+        .filter(|pool_fee| pool_fee.amount_sats > 0)
+}
+
+fn pinned_first_output_for_policy(manifest: &PayoutPolicyManifest) -> Option<PinnedFirstOutput> {
+    pool_fee_first_output(manifest).map(|pool_fee| PinnedFirstOutput {
+        recipient_id: pool_fee.recipient_id.clone(),
+        order_key: pool_fee.order_key.clone(),
+        p2mr_program_hex: pool_fee.p2mr_program_hex.clone(),
+    })
+}
+
+fn pinned_settlement_recipient_for_policy(
+    manifest: &PayoutPolicyManifest,
+) -> Option<SettlementRecipient> {
+    pool_fee_first_output(manifest).map(|pool_fee| SettlementRecipient {
+        recipient_id: pool_fee.recipient_id.clone(),
+        order_key: pool_fee.order_key.clone(),
+        p2mr_program_hex: pool_fee.p2mr_program_hex.clone(),
+        amount_sats: pool_fee.amount_sats,
     })
 }
 
@@ -895,6 +1046,7 @@ pub fn build_policy_coinbase_request_with_coinbase_options(
         witness_nonce_hex: None,
         witness_merkle_leaves_hex,
         coinbase_script_sig_suffix_hex,
+        pinned_first_output: pinned_first_output_for_policy(&manifest),
     };
     Ok((request, manifest))
 }
@@ -1144,16 +1296,25 @@ pub fn build_audit_bundle_with_coinbase_options(
     {
         return Err(PrismError::LedgerAttestationKeyReuse);
     }
-    let reward_manifest = build_prism_reward_manifest(&shares, &found_block)?;
-    let ledger_window_attestation =
-        build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)?;
+    let reward_manifest = profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
+        build_prism_reward_manifest(&shares, &found_block)
+    })?;
+    let ledger_window_attestation = profile_audit_build_phase(AUDIT_BUILD_SIGNING_PHASE, || {
+        build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)
+    })?;
     let payout_policy_manifest =
-        apply_payout_policy(&reward_manifest, &prior_balances, &payout_policy)?;
-    let audit_commitment_leaves_hex = vec![prism_audit_commitment_leaf_hex(
-        &reward_manifest,
-        &payout_policy_manifest,
-    )?];
-    let audit_commitment_root_hex = audit_commitment_root_hex(&audit_commitment_leaves_hex)?;
+        profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
+            apply_payout_policy(&reward_manifest, &prior_balances, &payout_policy)
+        })?;
+    let (audit_commitment_leaves_hex, audit_commitment_root_hex) =
+        profile_audit_build_phase(AUDIT_BUILD_COINBASE_PHASE, || {
+            let leaves = vec![prism_audit_commitment_leaf_hex(
+                &reward_manifest,
+                &payout_policy_manifest,
+            )?];
+            let root = audit_commitment_root_hex(&leaves)?;
+            Ok::<_, PrismError>((leaves, root))
+        })?;
     let coinbase_request = CoinbaseBuildRequest {
         block_height: reward_manifest.block_height,
         coinbase_value_sats: reward_manifest.coinbase_value_sats,
@@ -1161,8 +1322,10 @@ pub fn build_audit_bundle_with_coinbase_options(
         witness_nonce_hex: Some(audit_commitment_root_hex.clone()),
         witness_merkle_leaves_hex: witness_merkle_leaves_hex.clone(),
         coinbase_script_sig_suffix_hex: coinbase_script_sig_suffix_hex.clone(),
+        pinned_first_output: pinned_first_output_for_policy(&payout_policy_manifest),
     };
-    let signed_coinbase_manifest = build_signed_manifest(coinbase_request, coinbase_signing_key)?;
+    let signed_coinbase_manifest =
+        build_profiled_signed_manifest(coinbase_request, coinbase_signing_key)?;
 
     Ok(AuditBundle {
         schema: audit_bundle_schema_for_shares(&shares).to_string(),
@@ -1203,87 +1366,108 @@ pub fn build_audit_bundle_with_ctv_settlement_options(
     {
         return Err(PrismError::LedgerAttestationKeyReuse);
     }
-    let reward_manifest = build_prism_reward_manifest(&shares, &found_block)?;
-    let ledger_window_attestation =
-        build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)?;
-    let mut payout_policy_manifest =
-        apply_payout_policy(&reward_manifest, &prior_balances, &payout_policy)?;
-    let settlement_recipients =
-        settlement_recipients_from_entitlements(&payout_policy_manifest.onchain_entitlements)?;
-    let settlement_mode_decision = select_settlement_mode(
-        &settlement_recipients,
-        direct_floor_sats,
-        &settlement_config,
-    )?;
-    let fanout_fee_recipients = if let Some(fee_policy) = ctv_fanout_fee_policy.as_ref() {
-        apply_ctv_fanout_fee_accounting(
-            &mut payout_policy_manifest,
-            &settlement_mode_decision,
-            fee_policy,
-        )?
-    } else {
-        BTreeMap::new()
-    };
-    let reward_manifest_sha256_hex =
-        sha256_hex(&canonical_reward_manifest_bytes(&reward_manifest)?);
-    let payout_policy_manifest_sha256_hex = sha256_hex(&canonical_payout_policy_manifest_bytes(
-        &payout_policy_manifest,
-    )?);
+    let reward_manifest = profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
+        build_prism_reward_manifest(&shares, &found_block)
+    })?;
+    let ledger_window_attestation = profile_audit_build_phase(AUDIT_BUILD_SIGNING_PHASE, || {
+        build_ledger_window_attestation(&reward_manifest, &prior_balances, ledger_signing_key)
+    })?;
+    let (payout_policy_manifest, settlement_mode_decision, fanout_fee_recipients) =
+        profile_audit_build_phase(AUDIT_BUILD_PAYOUT_DERIVATION_PHASE, || {
+            let mut payout_manifest =
+                apply_payout_policy(&reward_manifest, &prior_balances, &payout_policy)?;
+            let settlement_recipients =
+                settlement_recipients_from_entitlements(&payout_manifest.onchain_entitlements)?;
+            let pinned_settlement_recipient =
+                pinned_settlement_recipient_for_policy(&payout_manifest);
+            let settlement_decision = select_settlement_mode_with_pinned_direct(
+                &settlement_recipients,
+                direct_floor_sats,
+                &settlement_config,
+                pinned_settlement_recipient.as_ref(),
+            )?;
+            let fee_recipients = if let Some(fee_policy) = ctv_fanout_fee_policy.as_ref() {
+                apply_ctv_fanout_fee_accounting(
+                    &mut payout_manifest,
+                    &settlement_decision,
+                    fee_policy,
+                )?
+            } else {
+                BTreeMap::new()
+            };
+            Ok::<_, PrismError>((payout_manifest, settlement_decision, fee_recipients))
+        })?;
+    let (reward_manifest_sha256_hex, payout_policy_manifest_sha256_hex) =
+        profile_audit_build_phase(AUDIT_BUILD_CTV_MANIFEST_PHASE, || {
+            Ok::<_, PrismError>((
+                sha256_hex(&canonical_reward_manifest_bytes(&reward_manifest)?),
+                sha256_hex(&canonical_payout_policy_manifest_bytes(
+                    &payout_policy_manifest,
+                )?),
+            ))
+        })?;
 
-    let mut prepared_fanouts = Vec::new();
-    for chunk in &settlement_mode_decision.fanout_chunks {
-        let chunk_index =
-            u32::try_from(chunk.chunk_index).map_err(|_| PrismError::PayoutPolicyOverflow)?;
-        let chunk_count = u32::try_from(settlement_mode_decision.fanout_chunk_count)
-            .map_err(|_| PrismError::PayoutPolicyOverflow)?;
-        prepared_fanouts.push(prepare_ctv_fanout_precommitment(
-            CtvFanoutPrecommitmentInput {
-                block_height: reward_manifest.block_height,
-                chunk_index,
-                chunk_count,
-                coinbase_value_sats: reward_manifest.coinbase_value_sats,
-                settlement_mode: settlement_mode_decision.mode.clone(),
-                reward_manifest_sha256_hex: reward_manifest_sha256_hex.clone(),
-                payout_policy_manifest_sha256_hex: payout_policy_manifest_sha256_hex.clone(),
-                payouts: chunk
-                    .recipients
+    let prepared_fanouts = profile_audit_build_phase(AUDIT_BUILD_CTV_MANIFEST_PHASE, || {
+        let mut prepared = Vec::new();
+        for chunk in &settlement_mode_decision.fanout_chunks {
+            let chunk_index =
+                u32::try_from(chunk.chunk_index).map_err(|_| PrismError::PayoutPolicyOverflow)?;
+            let chunk_count = u32::try_from(settlement_mode_decision.fanout_chunk_count)
+                .map_err(|_| PrismError::PayoutPolicyOverflow)?;
+            prepared.push(prepare_ctv_fanout_precommitment(
+                CtvFanoutPrecommitmentInput {
+                    block_height: reward_manifest.block_height,
+                    chunk_index,
+                    chunk_count,
+                    coinbase_value_sats: reward_manifest.coinbase_value_sats,
+                    settlement_mode: settlement_mode_decision.mode.clone(),
+                    reward_manifest_sha256_hex: reward_manifest_sha256_hex.clone(),
+                    payout_policy_manifest_sha256_hex: payout_policy_manifest_sha256_hex.clone(),
+                    payouts: chunk
+                        .recipients
+                        .iter()
+                        .map(|recipient| {
+                            let fee_recipient = fanout_fee_recipients.get(&account_key(
+                                &recipient.recipient_id,
+                                &recipient.order_key,
+                                &recipient.p2mr_program_hex,
+                            ));
+                            CtvFanoutPayout {
+                                recipient_id: recipient.recipient_id.clone(),
+                                order_key: recipient.order_key.clone(),
+                                p2mr_program_hex: recipient.p2mr_program_hex.clone(),
+                                gross_amount_sats: fee_recipient
+                                    .map(|recipient| recipient.gross_amount_sats)
+                                    .unwrap_or(0),
+                                fee_sats: fee_recipient
+                                    .map(|recipient| recipient.fee_sats)
+                                    .unwrap_or(0),
+                                amount_sats: fee_recipient
+                                    .map(|recipient| recipient.net_amount_sats)
+                                    .unwrap_or(recipient.amount_sats),
+                            }
+                        })
+                        .collect(),
+                },
+            )?);
+        }
+        Ok::<_, PrismError>(prepared)
+    })?;
+
+    let (audit_commitment_leaves_hex, audit_commitment_root_hex) =
+        profile_audit_build_phase(AUDIT_BUILD_COINBASE_PHASE, || {
+            let mut leaves = vec![prism_audit_commitment_leaf_hex(
+                &reward_manifest,
+                &payout_policy_manifest,
+            )?];
+            leaves.extend(
+                prepared_fanouts
                     .iter()
-                    .map(|recipient| {
-                        let fee_recipient = fanout_fee_recipients.get(&account_key(
-                            &recipient.recipient_id,
-                            &recipient.order_key,
-                            &recipient.p2mr_program_hex,
-                        ));
-                        CtvFanoutPayout {
-                            recipient_id: recipient.recipient_id.clone(),
-                            order_key: recipient.order_key.clone(),
-                            p2mr_program_hex: recipient.p2mr_program_hex.clone(),
-                            gross_amount_sats: fee_recipient
-                                .map(|recipient| recipient.gross_amount_sats)
-                                .unwrap_or(0),
-                            fee_sats: fee_recipient
-                                .map(|recipient| recipient.fee_sats)
-                                .unwrap_or(0),
-                            amount_sats: fee_recipient
-                                .map(|recipient| recipient.net_amount_sats)
-                                .unwrap_or(recipient.amount_sats),
-                        }
-                    })
-                    .collect(),
-            },
-        )?);
-    }
-
-    let mut audit_commitment_leaves_hex = vec![prism_audit_commitment_leaf_hex(
-        &reward_manifest,
-        &payout_policy_manifest,
-    )?];
-    audit_commitment_leaves_hex.extend(
-        prepared_fanouts
-            .iter()
-            .map(|fanout| fanout.commitment_witness_leaf_hex.clone()),
-    );
-    let audit_commitment_root_hex = audit_commitment_root_hex(&audit_commitment_leaves_hex)?;
+                    .map(|fanout| fanout.commitment_witness_leaf_hex.clone()),
+            );
+            let root = audit_commitment_root_hex(&leaves)?;
+            Ok::<_, PrismError>((leaves, root))
+        })?;
 
     let coinbase_request = CoinbaseBuildRequest {
         block_height: reward_manifest.block_height,
@@ -1295,29 +1479,36 @@ pub fn build_audit_bundle_with_ctv_settlement_options(
         witness_nonce_hex: Some(audit_commitment_root_hex.clone()),
         witness_merkle_leaves_hex: witness_merkle_leaves_hex.clone(),
         coinbase_script_sig_suffix_hex: coinbase_script_sig_suffix_hex.clone(),
+        pinned_first_output: pinned_first_output_for_policy(&payout_policy_manifest),
     };
-    let signed_coinbase_manifest = build_signed_manifest(coinbase_request, coinbase_signing_key)?;
+    let signed_coinbase_manifest =
+        build_profiled_signed_manifest(coinbase_request, coinbase_signing_key)?;
     let ctv_fanout_manifest_set = if prepared_fanouts.is_empty() {
         None
     } else {
-        let manifests = prepared_fanouts
-            .into_iter()
-            .map(|prepared| {
-                let parent_vout = find_coinbase_output_vout(
-                    &signed_coinbase_manifest.manifest,
-                    &prepared.covenant_recipient_id,
-                    &prepared.covenant_order_key,
-                    &prepared.covenant_p2mr_program_hex,
-                    prepared.covenant_output_value_sats,
-                )?;
-                build_ctv_fanout_manifest_from_precommitment(
-                    prepared.precommitment,
-                    signed_coinbase_manifest.manifest.coinbase_tx_hex.clone(),
-                    parent_vout,
-                )
-            })
-            .collect::<Result<Vec<_>, PrismError>>()?;
-        Some(build_ctv_fanout_manifest_set(manifests)?)
+        Some(profile_audit_build_phase(
+            AUDIT_BUILD_CTV_MANIFEST_PHASE,
+            || {
+                let manifests = prepared_fanouts
+                    .into_iter()
+                    .map(|prepared| {
+                        let parent_vout = find_coinbase_output_vout(
+                            &signed_coinbase_manifest.manifest,
+                            &prepared.covenant_recipient_id,
+                            &prepared.covenant_order_key,
+                            &prepared.covenant_p2mr_program_hex,
+                            prepared.covenant_output_value_sats,
+                        )?;
+                        build_ctv_fanout_manifest_from_precommitment(
+                            prepared.precommitment,
+                            signed_coinbase_manifest.manifest.coinbase_tx_hex.clone(),
+                            parent_vout,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, PrismError>>()?;
+                build_ctv_fanout_manifest_set(manifests)
+            },
+        )?)
     };
 
     Ok(AuditBundle {
@@ -1545,6 +1736,68 @@ fn verify_ctv_settlement_bundle(
     Ok(entitlements)
 }
 
+/// Enforce the committed coinbase output policy against the built coinbase.
+///
+/// Under `pool-fee-first` with a positive pool fee the fee output must be a
+/// direct coinbase output at vout 0, and must not appear inside any CTV
+/// fanout chunk. Canonical policy (or a zero fee) imposes no constraint here.
+fn verify_coinbase_output_policy(
+    policy_manifest: &PayoutPolicyManifest,
+    settlement_mode_decision: Option<&SettlementModeDecision>,
+    coinbase_manifest: &PayoutManifest,
+) -> Result<(), PrismError> {
+    let Some(pool_fee) = pool_fee_first_output(policy_manifest) else {
+        return Ok(());
+    };
+    let matches_pool_fee = |recipient_id: &str, order_key: &str, p2mr_program_hex: &str| {
+        recipient_id == pool_fee.recipient_id
+            && order_key == pool_fee.order_key
+            && p2mr_program_hex.eq_ignore_ascii_case(&pool_fee.p2mr_program_hex)
+    };
+    let first_output = coinbase_manifest
+        .outputs
+        .first()
+        .ok_or(PrismError::AuditMismatch {
+            artifact: "coinbase_output_policy",
+        })?;
+    if first_output.vout != 0
+        || !matches_pool_fee(
+            &first_output.recipient_id,
+            &first_output.order_key,
+            &first_output.p2mr_program_hex,
+        )
+        || first_output.amount_sats != pool_fee.amount_sats
+    {
+        return Err(PrismError::AuditMismatch {
+            artifact: "coinbase_output_policy",
+        });
+    }
+    if let Some(decision) = settlement_mode_decision {
+        let fee_is_direct = decision.direct_recipients.iter().any(|recipient| {
+            matches_pool_fee(
+                &recipient.recipient_id,
+                &recipient.order_key,
+                &recipient.p2mr_program_hex,
+            )
+        });
+        let fee_in_fanout = decision.fanout_chunks.iter().any(|chunk| {
+            chunk.recipients.iter().any(|recipient| {
+                matches_pool_fee(
+                    &recipient.recipient_id,
+                    &recipient.order_key,
+                    &recipient.p2mr_program_hex,
+                )
+            })
+        });
+        if !fee_is_direct || fee_in_fanout {
+            return Err(PrismError::AuditMismatch {
+                artifact: "coinbase_output_policy",
+            });
+        }
+    }
+    Ok(())
+}
+
 fn settlement_recipient_cmp(
     left: &SettlementRecipient,
     right: &SettlementRecipient,
@@ -1598,6 +1851,11 @@ pub fn verify_audit_bundle(
             artifact: "payout_policy_manifest",
         });
     }
+    verify_coinbase_output_policy(
+        &expected_policy_manifest,
+        bundle.settlement_mode_decision.as_ref(),
+        &bundle.signed_coinbase_manifest.manifest,
+    )?;
     let expected_audit_commitment_leaf =
         prism_audit_commitment_leaf_hex(&expected_reward_manifest, &expected_policy_manifest)?;
     let mut expected_audit_commitment_leaves = vec![expected_audit_commitment_leaf.clone()];
@@ -1648,6 +1906,7 @@ pub fn verify_audit_bundle(
         witness_nonce_hex: Some(expected_audit_commitment_root_hex),
         witness_merkle_leaves_hex: bundle.witness_merkle_leaves_hex.clone(),
         coinbase_script_sig_suffix_hex: bundle.coinbase_script_sig_suffix_hex.clone(),
+        pinned_first_output: pinned_first_output_for_policy(&expected_policy_manifest),
     };
 
     let expected_coinbase_manifest = build_manifest(expected_coinbase_request)?;
@@ -1728,6 +1987,7 @@ fn audit_verification_report(
         coinbase_wtxid: coinbase_manifest.coinbase_wtxid.clone(),
         coinbase_tx_hex: coinbase_manifest.coinbase_tx_hex.clone(),
         min_output_sats: bundle.payout_policy_manifest.min_output_sats,
+        coinbase_output_policy: bundle.payout_policy_manifest.coinbase_output_policy,
         onchain_output_count: coinbase_manifest.outputs.len(),
         accrued_account_count: bundle
             .payout_policy_manifest
@@ -1770,6 +2030,10 @@ fn pool_fee_manifest(
 
 fn is_default_account_type(account_type: &PayoutPolicyAccountType) -> bool {
     *account_type == PayoutPolicyAccountType::Miner
+}
+
+fn is_default_coinbase_output_policy(policy: &CoinbaseOutputPolicy) -> bool {
+    *policy == CoinbaseOutputPolicy::Canonical
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -3734,6 +3998,502 @@ mod tests {
         let report = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
         assert_eq!(report.coinbase_value_sats, 100_000);
         assert_eq!(report.onchain_output_count, 2);
+    }
+
+    fn pool_fee_first_payout_policy(fee_bps: u16) -> PayoutPolicy {
+        let mut payout_policy = PayoutPolicy::day_one_default();
+        payout_policy.pool_fee_policy = Some(PoolFeePolicy {
+            fee_bps,
+            recipient_id: "pool-fee".to_string(),
+            order_key: "zzzzzzzz".to_string(),
+            p2mr_program_hex: "ff".repeat(32),
+        });
+        payout_policy.coinbase_output_policy = CoinbaseOutputPolicy::PoolFeeFirst;
+        payout_policy
+    }
+
+    #[test]
+    fn canonical_policy_keeps_payout_policy_serialization_bytes() {
+        let policy_json = serde_json::to_value(PayoutPolicy::day_one_default()).unwrap();
+        assert!(policy_json.get("coinbase_output_policy").is_none());
+
+        let manifest = apply_payout_policy(
+            &build_prism_reward_manifest(
+                &[share(1, "miner-a", "01", 1, 3, 1000)],
+                &found_block(5, 1000),
+            )
+            .unwrap(),
+            &[],
+            &PayoutPolicy::day_one_default(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.coinbase_output_policy,
+            CoinbaseOutputPolicy::Canonical
+        );
+        let manifest_json = serde_json::to_value(&manifest).unwrap();
+        assert!(manifest_json.get("coinbase_output_policy").is_none());
+    }
+
+    #[test]
+    fn unknown_coinbase_output_policy_values_are_rejected() {
+        let mut policy_json = serde_json::to_value(PayoutPolicy::day_one_default()).unwrap();
+        policy_json["coinbase_output_policy"] = serde_json::json!("fee-first");
+        assert!(serde_json::from_value::<PayoutPolicy>(policy_json.clone()).is_err());
+
+        policy_json["coinbase_output_policy"] = serde_json::json!("pool-fee-first");
+        let decoded = serde_json::from_value::<PayoutPolicy>(policy_json).unwrap();
+        assert_eq!(
+            decoded.coinbase_output_policy,
+            CoinbaseOutputPolicy::PoolFeeFirst
+        );
+    }
+
+    #[test]
+    fn pool_fee_first_pins_positive_fee_at_vout_zero_in_plain_bundle() {
+        let found_block = FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 1_000_000,
+            network_difficulty: 5,
+            anchor_job_issued_at_ms: 1000,
+        };
+
+        let bundle = build_audit_bundle(
+            vec![
+                share(1, "miner-a", "01", 1, 3, 1000),
+                share(2, "miner-b", "02", 2, 2, 1000),
+            ],
+            found_block,
+            Vec::new(),
+            pool_fee_first_payout_policy(200),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            bundle.payout_policy_manifest.coinbase_output_policy,
+            CoinbaseOutputPolicy::PoolFeeFirst
+        );
+        let manifest_bytes =
+            canonical_payout_policy_manifest_bytes(&bundle.payout_policy_manifest).unwrap();
+        assert!(String::from_utf8(manifest_bytes)
+            .unwrap()
+            .contains("\"coinbase_output_policy\":\"pool-fee-first\""));
+        assert_eq!(
+            bundle
+                .signed_coinbase_manifest
+                .manifest
+                .outputs
+                .iter()
+                .map(|output| (output.recipient_id.as_str(), output.amount_sats))
+                .collect::<Vec<_>>(),
+            vec![
+                ("pool-fee", 20_000),
+                ("miner-a", 588_000),
+                ("miner-b", 392_000)
+            ]
+        );
+
+        let report = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+        assert_eq!(
+            report.coinbase_output_policy,
+            CoinbaseOutputPolicy::PoolFeeFirst
+        );
+        let report_json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            report_json.get("coinbase_output_policy"),
+            Some(&serde_json::json!("pool-fee-first"))
+        );
+    }
+
+    #[test]
+    fn pool_fee_first_pins_sub_floor_fee_direct_at_vout_zero_in_hybrid_ctv() {
+        let found_block = FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 1_000_000,
+            network_difficulty: 5,
+            anchor_job_issued_at_ms: 1000,
+        };
+        let config = SettlementModeConfig {
+            max_coinbase_settlement_outputs: 16,
+            max_direct_coinbase_outputs: 2,
+            max_fanout_recipients_per_transaction: 10,
+            reserved_coinbase_outputs: 0,
+        };
+
+        let bundle = build_audit_bundle_with_ctv_settlement_options(
+            vec![
+                share(1, "miner-a", "01", 1, 3, 1000),
+                share(2, "miner-b", "02", 2, 2, 1000),
+            ],
+            found_block,
+            Vec::new(),
+            pool_fee_first_payout_policy(200),
+            50_000,
+            config,
+            None,
+            Some("aaaaaaaa".to_string()),
+            Vec::new(),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+
+        // The 20,000-sat fee is below the 50,000-sat direct floor yet still
+        // settles as a direct output at vout 0.
+        let decision = bundle.settlement_mode_decision.as_ref().unwrap();
+        assert_eq!(decision.mode, SettlementMode::HybridCoinbaseCtvFanout);
+        assert!(decision
+            .direct_recipients
+            .iter()
+            .any(|recipient| recipient.recipient_id == "pool-fee"));
+        assert!(decision.fanout_chunks.iter().all(|chunk| chunk
+            .recipients
+            .iter()
+            .all(|recipient| recipient.recipient_id != "pool-fee")));
+        assert!(decision
+            .reason
+            .contains("pinned by the coinbase output policy"));
+
+        assert_eq!(
+            bundle
+                .signed_coinbase_manifest
+                .manifest
+                .outputs
+                .iter()
+                .map(|output| (output.recipient_id.as_str(), output.amount_sats))
+                .collect::<Vec<_>>(),
+            vec![
+                ("pool-fee", 20_000),
+                ("miner-a", 588_000),
+                ("ctv-fanout-0", 392_000)
+            ]
+        );
+
+        let fanout_set = bundle.ctv_fanout_manifest_set.as_ref().unwrap();
+        assert_eq!(fanout_set.manifests[0].parent_coinbase_vout, 2);
+
+        let report = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+        assert_eq!(report.onchain_output_count, 3);
+        assert_eq!(
+            report.coinbase_output_policy,
+            CoinbaseOutputPolicy::PoolFeeFirst
+        );
+    }
+
+    #[test]
+    fn pool_fee_first_keeps_fee_direct_when_direct_selection_would_exclude_it() {
+        let found_block = FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 1_000_000,
+            network_difficulty: 5,
+            anchor_job_issued_at_ms: 1000,
+        };
+        let config = SettlementModeConfig {
+            max_coinbase_settlement_outputs: 16,
+            max_direct_coinbase_outputs: 1,
+            max_fanout_recipients_per_transaction: 10,
+            reserved_coinbase_outputs: 0,
+        };
+
+        let bundle = build_audit_bundle_with_ctv_settlement_options(
+            vec![
+                share(1, "miner-a", "01", 1, 3, 1000),
+                share(2, "miner-b", "02", 2, 2, 1000),
+            ],
+            found_block,
+            Vec::new(),
+            pool_fee_first_payout_policy(200),
+            50_000,
+            config,
+            None,
+            Some("aaaaaaaa".to_string()),
+            Vec::new(),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+
+        // Amount-priority selection alone would pick a miner for the single
+        // direct slot; the policy hands that slot to the fee instead.
+        let decision = bundle.settlement_mode_decision.as_ref().unwrap();
+        assert_eq!(decision.mode, SettlementMode::HybridCoinbaseCtvFanout);
+        assert_eq!(
+            decision
+                .direct_recipients
+                .iter()
+                .map(|recipient| recipient.recipient_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pool-fee"]
+        );
+        assert_eq!(decision.fanout_recipient_count, 2);
+        assert_eq!(
+            bundle
+                .signed_coinbase_manifest
+                .manifest
+                .outputs
+                .iter()
+                .map(|output| output.recipient_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pool-fee", "ctv-fanout-0"]
+        );
+        assert_eq!(
+            bundle
+                .ctv_fanout_manifest_set
+                .as_ref()
+                .unwrap()
+                .manifests[0]
+                .parent_coinbase_vout,
+            1
+        );
+
+        verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+    }
+
+    #[test]
+    fn pool_fee_first_fails_when_the_fee_slot_cannot_fit_the_output_budget() {
+        let found_block = FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 1_000_000,
+            network_difficulty: 5,
+            anchor_job_issued_at_ms: 1000,
+        };
+        let config = SettlementModeConfig {
+            max_coinbase_settlement_outputs: 1,
+            max_direct_coinbase_outputs: 1,
+            max_fanout_recipients_per_transaction: 10,
+            reserved_coinbase_outputs: 0,
+        };
+        let shares = vec![
+            share(1, "miner-a", "01", 1, 3, 1000),
+            share(2, "miner-b", "02", 2, 2, 1000),
+        ];
+
+        // Canonical settlement fits the same recipients into the one-output
+        // budget as a single fanout chunk.
+        let mut canonical_policy = pool_fee_first_payout_policy(200);
+        canonical_policy.coinbase_output_policy = CoinbaseOutputPolicy::Canonical;
+        build_audit_bundle_with_ctv_settlement_options(
+            shares.clone(),
+            found_block.clone(),
+            Vec::new(),
+            canonical_policy,
+            2_000_000,
+            config,
+            None,
+            Some("aaaaaaaa".to_string()),
+            Vec::new(),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+
+        // Reserving the direct fee slot overflows the budget and job
+        // construction fails instead of demoting the fee.
+        let err = build_audit_bundle_with_ctv_settlement_options(
+            shares,
+            found_block,
+            Vec::new(),
+            pool_fee_first_payout_policy(200),
+            2_000_000,
+            config,
+            None,
+            Some("aaaaaaaa".to_string()),
+            Vec::new(),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, PrismError::SettlementModeSelection { .. }));
+        assert!(err.to_string().contains("more than 1"));
+    }
+
+    #[test]
+    fn pool_fee_first_with_zero_fee_output_behaves_canonically() {
+        let found_block = FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 1_000_000,
+            network_difficulty: 5,
+            anchor_job_issued_at_ms: 1000,
+        };
+
+        let bundle = build_audit_bundle(
+            vec![
+                share(1, "miner-a", "01", 1, 3, 1000),
+                share(2, "miner-b", "02", 2, 2, 1000),
+            ],
+            found_block,
+            Vec::new(),
+            pool_fee_first_payout_policy(0),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            bundle
+                .payout_policy_manifest
+                .pool_fee
+                .as_ref()
+                .unwrap()
+                .amount_sats,
+            0
+        );
+        assert_eq!(
+            bundle
+                .signed_coinbase_manifest
+                .manifest
+                .outputs
+                .iter()
+                .map(|output| output.recipient_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["miner-a", "miner-b"]
+        );
+        verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+    }
+
+    #[test]
+    fn pool_fee_first_without_a_pool_fee_policy_is_rejected() {
+        let found_block = FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 1_000_000,
+            network_difficulty: 5,
+            anchor_job_issued_at_ms: 1000,
+        };
+        let mut policy = PayoutPolicy::day_one_default();
+        policy.coinbase_output_policy = CoinbaseOutputPolicy::PoolFeeFirst;
+
+        let err = build_audit_bundle(
+            vec![
+                share(1, "miner-a", "01", 1, 3, 1000),
+                share(2, "miner-b", "02", 2, 2, 1000),
+            ],
+            found_block,
+            Vec::new(),
+            policy,
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, PrismError::PoolFeeFirstRequiresPoolFee));
+    }
+
+    #[test]
+    fn verifier_rejects_pool_fee_first_bundle_without_a_pool_fee_policy() {
+        let found_block = FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 1_000_000,
+            network_difficulty: 5,
+            anchor_job_issued_at_ms: 1000,
+        };
+
+        // A canonical no-fee bundle stamped as pool-fee-first after the fact
+        // must not verify: the committed policy has no pool-fee manifest to
+        // honor, which is distinct from a configured zero-bps fee.
+        let mut bundle = build_audit_bundle(
+            vec![
+                share(1, "miner-a", "01", 1, 3, 1000),
+                share(2, "miner-b", "02", 2, 2, 1000),
+            ],
+            found_block,
+            Vec::new(),
+            PayoutPolicy::day_one_default(),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+        bundle.payout_policy.coinbase_output_policy = CoinbaseOutputPolicy::PoolFeeFirst;
+        bundle.payout_policy_manifest.coinbase_output_policy = CoinbaseOutputPolicy::PoolFeeFirst;
+
+        let err = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap_err();
+        assert!(matches!(err, PrismError::PoolFeeFirstRequiresPoolFee));
+    }
+
+    #[test]
+    fn verifier_rejects_pool_fee_first_bundle_whose_fee_output_is_not_first() {
+        let found_block = FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 1_000_000,
+            network_difficulty: 5,
+            anchor_job_issued_at_ms: 1000,
+        };
+        let config = SettlementModeConfig {
+            max_coinbase_settlement_outputs: 16,
+            max_direct_coinbase_outputs: 1,
+            max_fanout_recipients_per_transaction: 10,
+            reserved_coinbase_outputs: 0,
+        };
+        let mut canonical_policy = pool_fee_first_payout_policy(200);
+        canonical_policy.coinbase_output_policy = CoinbaseOutputPolicy::Canonical;
+
+        // Canonical construction routes the sub-floor fee into the fanout
+        // chunk. Stamping the bundle as pool-fee-first afterwards must not
+        // verify: the committed policy demands a direct vout-0 fee output.
+        let mut bundle = build_audit_bundle_with_ctv_settlement_options(
+            vec![
+                share(1, "miner-a", "01", 1, 3, 1000),
+                share(2, "miner-b", "02", 2, 2, 1000),
+            ],
+            found_block,
+            Vec::new(),
+            canonical_policy,
+            50_000,
+            config,
+            None,
+            Some("aaaaaaaa".to_string()),
+            Vec::new(),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+        bundle.payout_policy.coinbase_output_policy = CoinbaseOutputPolicy::PoolFeeFirst;
+        bundle.payout_policy_manifest.coinbase_output_policy = CoinbaseOutputPolicy::PoolFeeFirst;
+
+        let err = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap_err();
+        assert!(matches!(
+            err,
+            PrismError::AuditMismatch {
+                artifact: "coinbase_output_policy"
+            }
+        ));
+    }
+
+    #[test]
+    fn verifier_rejects_policy_downgrade_of_pool_fee_first_bundle() {
+        let found_block = FoundBlock {
+            block_height: 101,
+            coinbase_value_sats: 1_000_000,
+            network_difficulty: 5,
+            anchor_job_issued_at_ms: 1000,
+        };
+
+        let mut bundle = build_audit_bundle(
+            vec![
+                share(1, "miner-a", "01", 1, 3, 1000),
+                share(2, "miner-b", "02", 2, 2, 1000),
+            ],
+            found_block,
+            Vec::new(),
+            pool_fee_first_payout_policy(200),
+            &manifest_signing_key(),
+            &ledger_signing_key(),
+        )
+        .unwrap();
+        bundle.payout_policy.coinbase_output_policy = CoinbaseOutputPolicy::Canonical;
+        bundle.payout_policy_manifest.coinbase_output_policy = CoinbaseOutputPolicy::Canonical;
+
+        // The commitment leaves were built over the pool-fee-first manifest,
+        // so a canonical downgrade breaks the audit commitment chain.
+        let err = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap_err();
+        assert!(matches!(
+            err,
+            PrismError::AuditMismatch {
+                artifact: "audit_commitment_leaves"
+            }
+        ));
     }
 
     #[test]

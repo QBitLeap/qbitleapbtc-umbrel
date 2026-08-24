@@ -56,6 +56,36 @@ The ledger is single-writer, not active-active. A replacement writer takes the
 lease after expiry. Active-active insertion would create ambiguous ordering and
 is outside the accepted PRISM contract.
 
+Graceful coordinator shutdown closes Stratum admission and all background
+writer admission first, then waits for admitted share batches, accepted-block
+finalization, CTV status updates, and payout/reorg mutations to finish. It
+releases the exact-session writer lease immediately after that writer barrier;
+client socket delivery, obsolete job fanout, and executor/thread cleanup drain
+after release and therefore cannot delay a replacement writer. SIGTERM only
+closes admission and wakes the serve loop; the barrier and database work run
+outside the signal handler.
+
+`PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS` bounds the writer barrier and defaults
+to 15 seconds. This leaves time for conservative synchronous Postgres flushing
+while remaining well below the default 60-second lease TTL. If the timeout
+expires, the coordinator logs each still-active writer component and
+deliberately does not release the lease; process termination and TTL fencing
+then preserve the single-writer invariant. Do not shorten this below the
+durable flush time of the deployed Postgres system.
+
+Shutdown emits structured JSON log events named `shutdown_start`,
+`writer_quiescence`, `lease_release_attempt`, `lease_release`,
+`lease_release_withheld`, and `non_writer_drain`. Prometheus exposes the same
+path through `qbit_prism_shutdowns_total`,
+`qbit_prism_shutdown_writer_quiescence_seconds`,
+`qbit_prism_shutdown_writer_quiescence_total`,
+`qbit_prism_shutdown_lease_release_attempts_total`,
+`qbit_prism_shutdown_lease_release_total`,
+`qbit_prism_shutdown_lease_release_seconds`,
+`qbit_prism_shutdown_sigterm_to_lease_release_seconds`,
+`qbit_prism_shutdown_non_writer_drain_seconds`, and
+`qbit_prism_shutdown_release_withheld_total`.
+
 ## Block Candidate Outbox
 
 A block-worthy share transaction also inserts an immutable intent into
@@ -64,18 +94,115 @@ context, reward inputs, and extranonce fields required to finish audit and
 submission. The share and intent become visible atomically before Stratum
 success.
 
-The in-memory candidate queue is only a bounded wakeup path. Queue saturation
-coalesces wakeups; it cannot delete an outbox row. Before opening Stratum
-listeners and whenever the queue drains, the coordinator replays pending rows.
+The bounded live-candidate queue is only a wakeup path. Queue saturation
+coalesces wakeups; it cannot delete an outbox row. Recovery restores pending
+rows in batches into a separate, lower-priority replay queue, without doing
+per-row database accounting. Live discoveries therefore always outrank restart
+work, while an older replay stalled in accounting cannot hide later durable
+rows. The pre-accept startup recovery pass is best-effort under a slow ledger:
+if its database budget expires, the coordinator finishes starting and the
+block-submitter loop retries every durable pending row with ordinary backoff.
+Because job builds stay blocked until every pending candidate is known, the
+startup enumeration must be provably untruncated: a full batch re-queries
+with a doubled window (capped at 1024 rows) until the outbox returns fewer
+rows than requested. If the cap is ever hit, the gate stays closed while the
+restored batch drains and the submitter loop re-enumerates the remainder.
+Before qbitd can observe a candidate, the coordinator installs a short in-memory
+prospective-payout barrier; this prevents startup prewarm from issuing child
+work from the old balance base without falsely claiming that the block landed.
+
+Once a durable candidate is dequeued, its qbit `submitblock` RPC is the fast
+lane: it runs before the attempt-marker write, accepted-block writer admission,
+audit construction, or payout publication. The node result and same-hash lease
+then transfer to an independent, height-prioritized accounting lane. A full
+primary handoff spills to a result-preserving overflow queue; it never turns an
+already-offered block back into a raw-submit retry. `block_submitter` and
+`block_accounting` expose independent phase heartbeats, so slow accounting does
+not delay later node offers or disguise the phase that stopped progressing.
+
+`PRISM_BLOCK_SUBMIT_RPC_TIMEOUT_SECONDS` bounds the fast-lane RPC (default 1
+second). `PRISM_BLOCK_SUBMIT_DB_TIMEOUT_SECONDS` gives each later Postgres
+statement and local ledger gate a fresh deadline (default 1 second); direct
+outbox reads and mutations additionally use a single-flight wrapper so a
+driver that ignores its deadline cannot accumulate retry threads. Timeouts
+leave the row pending and enter the ordinary candidate backoff.
+
+Landing-path observability lives on `/metrics`:
+`qbit_prism_block_ledger_calls_total` / `_call_timeouts_total` /
+`_call_budget_seconds` / `_call_last_duration_seconds` /
+`_call_max_duration_seconds` (labelled by `call_class`, `fast` vs
+`landing`), `qbit_prism_accepted_parent_unresolved_transitions` and
+`_unresolved_oldest_seconds`,
+`qbit_prism_accepted_parent_preview_wait_timeouts_total`,
+`qbit_prism_prior_balances_reads_total` / `_read_last_seconds` /
+`_read_max_seconds`, and `qbit_prism_startup_phase_seconds{phase=...}`.
+Alert before the landing deadline is exhausted, not after: page when
+`qbit_prism_prior_balances_read_max_seconds` exceeds ~20% of the
+landing budget or the poll budget, when any
+`qbit_prism_block_ledger_call_timeouts_total{call_class="landing"}`
+increment occurs, and when
+`qbit_prism_accepted_parent_unresolved_oldest_seconds` exceeds the
+preview wait budget. The #188 prior-balances read crossed the one-second
+line silently over several weeks; these series exist so that growth is a
+ticket, not an outage.
+
+Deadlines are split by call class. The poll-class budget above covers only
+cheap outbox polls and fast-lane-adjacent calls. The landing-class
+accounting tail — persisting an accepted block, reading prior balances,
+confirming it, and rejecting the prepared state of a terminal candidate —
+runs each statement under `PRISM_BLOCK_LANDING_DB_TIMEOUT_SECONDS`
+(default 30 seconds) starting with the first attempt. After an observed
+landing timeout the next attempt for the same block hash doubles its
+budget up to `PRISM_BLOCK_LANDING_DB_TIMEOUT_MAX_SECONDS` (default 120
+seconds); only ledger-originated deadlines count as landing timeouts —
+a node RPC timing out inside the landing tail neither escalates the
+next PostgreSQL budget nor increments the landing-timeout series; retries stay paced by the candidate backoff, server-side
+cancellation is confirmed by the ledger backends (the pooled session is
+rolled back or replaced, never reused mid-cancel), and the stuck-call and
+coordination watchdogs remain the overall bound. Startup replay of a
+pending accepted candidate re-enters the same landing-class scope, and
+the gating startup outbox enumeration both runs with the landing budget
+and records under `call_class="landing"`, so an enumeration timeout
+fires the landing-timeout alert rather than inflating the fast-call
+budget gauge. A
+landing-class operation must never start at the poll budget: a
+structurally slow landing under a one-second ceiling is statement-canceled
+on every attempt and can never converge (issue #188). Contended
+submit-path locks are acquired in heartbeat slices and identify the lock in a
+periodic diagnostic controlled by `PRISM_BLOCK_SUBMIT_LOCK_WAIT_LOG_SECONDS`
+(default 5 seconds). At most two timeout-ignoring RPC workers and two
+timeout-ignoring ledger workers may remain detached. If either bounded worker
+pool remains exhausted for `PRISM_BLOCK_SUBMIT_STUCK_CALL_EXIT_SECONDS`
+(default 30 seconds), the coordinator requests shutdown and exits nonzero so
+the supervisor replaces the poisoned process; durable outbox rows remain
+pending for replay. One detached call does not interrupt the healthy raw lane
+while the other bounded slot can still make progress.
+
 Successful submissions become `submitted`; candidates that definitively lose
 their tip race or fail validation become `abandoned`. If the process exits
-after `submitblock` but before finalizing the row, restart recognizes the
-candidate as the active tip and completes the idempotent confirmation path.
+after `submitblock` but before the attempt marker or terminal outbox update,
+restart resubmits the same bytes. qbit's accepted-duplicate response is a
+successful landing signal; block-hash-keyed ledger persistence and the
+finalize-only registry keep accounting and terminal side effects exactly once.
+Restart can also recognize the candidate as the active tip and complete the
+same idempotent confirmation path. Exact miner resubmissions observe an
+existing terminal outbox state in the same durable pre-submit transaction:
+`submitted` coalesces to success and `abandoned` stays rejected before any new
+node offer. Exact share replays return the original row as not newly inserted,
+so process-local worker and vardiff counters are not credited twice.
 Transient RPC, audit, and ledger outcomes remain pending and retry with an
 exponential delay starting at 250 milliseconds and capped at 30 seconds. They
-do not increment terminal abandonment counters. Replay carries the database
-row's block hash separately from candidate JSON, so malformed payloads can be
-quarantined by their authoritative outbox key instead of replaying forever.
+do not increment terminal abandonment counters. An abandonment is counted only
+after any prepared payout state is rejected and the false disposition is fixed;
+if cleanup fails, the candidate remains pending and can still converge to
+submitted on later chain evidence. Replay carries the database row's block hash
+separately from candidate JSON, so malformed payloads can be quarantined using
+the authoritative outbox key instead of replaying forever.
+
+The block submitter heartbeat carries its current phase, including replay
+query, node RPC, lock admission, audit, persistence, and finalization. A stale
+watchdog diagnostic therefore reports a label such as
+`block_submitter:replay-outbox-query` instead of only the thread name.
 
 When a network-valid hash is below a listener's advertised share target, the
 coordinator first stores a candidate-only intent, submits it synchronously, and
@@ -214,8 +341,44 @@ Useful environment variables:
 - `QBIT_PRISM_THROUGHPUT_REPORT`: JSON report path.
 
 The throughput harness measures schema/query capacity. It is separate from the
-lab `psql` adapter, which favors zero Python dependencies and shells out per
-operation for portability in regtest.
+lab ledger adapter's execution backends described below.
+
+## Hot-Path Execution Backends
+
+The lab ledger adapter (`PsqlShareLedger`) supports two interchangeable
+execution backends over the same SQL and the same durability contract:
+
+- **`psycopg-pool` (production default):** a persistent pooled psycopg client.
+  The coordinator's share-writer group commits (`PRISM_SHARE_COMMIT_BATCH_SIZE`
+  / `PRISM_SHARE_COMMIT_LINGER_MILLISECONDS`) execute as one round trip on a
+  long-lived connection instead of one `psql` fork+connect per statement; the
+  batch statement's own `set_config('synchronous_commit', 'on', true)` keeps
+  the Stratum ACK boundary at the database commit. Reads share a pool bounded
+  by `PRISM_POSTGRES_READ_CONCURRENCY` plus one writer slot. Read-only
+  statements retry once after a lost connection; mutations do not re-execute
+  automatically because a lost response cannot prove that PostgreSQL did not
+  commit the first execution.
+- **`psql-subprocess` (fallback):** the legacy zero-Python-dependency backend
+  that shells out one `psql` per statement. It remains fully supported for
+  regtest portability and as the operational escape hatch.
+
+`PRISM_POSTGRES_NATIVE_CLIENT` selects the backend: `auto` (default) uses the
+pooled client when psycopg is importable and a `postgres://` DSN is available
+(from `PRISM_DATABASE_URL` or inside `PRISM_POSTGRES_PSQL_COMMAND`), `1`
+requires it, and `0` forces the subprocess fallback. The coordinator startup
+line reports the active backend as `ledger_execution=`.
+
+Readiness and health counters (`accepted_share_stats`) are maintained
+incrementally by the single lease-holding writer and reconciled against the
+database once per `PRISM_ACCEPTED_STATS_CACHE_SECONDS` (default 60) instead of
+running `count(*) / count(DISTINCT miner_id)` aggregates every few seconds.
+
+`make test-prism-postgres-native-ledger` is the opt-in end-to-end validation
+for the pooled backend: it provisions a temporary Postgres container and
+exercises schema init, lease guards, concurrent batched appends, duplicate
+replay, cached stats, and cross-backend read consistency with the `psql`
+fallback. Run it on any docker host with `psycopg` installed before rolling
+the pooled backend into an environment.
 
 It does not simulate live Stratum miner swarms, reconnect storms, malformed
 client messages, or stale-share bursts across job changes. Those remain separate

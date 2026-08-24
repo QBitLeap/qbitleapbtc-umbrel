@@ -125,6 +125,39 @@ the same coordinator, share ledger, and settlement path. Because the reward
 window is difficulty-weighted, shares from either port earn proportional
 credit with no settlement changes.
 
+### Reconnect backpressure
+
+PRISM applies one global admission ceiling across the default and high-diff
+listeners before it allocates `ClientState` or starts a handler thread.
+`PRISM_STRATUM_MAX_CONNECTIONS` defaults to 384, above the normal 200-250
+production population. An environment that explicitly overrides it to `0`
+remains unlimited in local/regtest mode and must remove that override to receive
+containment; production startup rejects the unlimited override.
+
+After subscribe and authorize, clients awaiting first current-tip work enter a
+single priority delivery lane. `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS`
+(default 128) bounds that population, and
+`PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS` (default 30) expires requests that
+cannot be served. A zero timeout is supported for focused local tests, but the
+pending bound stays active. Initial delivery outranks new-tip replacement,
+same-tip/Vardiff refresh, and routine maintenance; duplicate authorization work
+is coalesced by connection and authorization generation.
+
+A first-job request that already has a usable cached bundle is served
+immediately, even while a publication-critical build is running. On a cache
+miss behind such a build, the request subscribes to that build's result and
+consumes it at completion instead of polling out the priority window and
+rebuilding. Transient payout-gate non-admission (a publication in flight, or a
+bundle generation going stale at the gate) retries within the request's own
+deadline rather than disconnecting the client.
+
+`/healthz` reports connection and pending capacity, current-tip job coverage,
+delivery progress, and overload state. It uses
+`PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS` (default 30) before persistent
+delivery failure can make health non-green. A full connection cap alone does
+not fail health while admitted miners retain current work and delivery is
+progressing.
+
 The high-diff listener is disabled unless `PRISM_STRATUM_HIGHDIFF_PORT` is
 set:
 
@@ -186,9 +219,32 @@ Operational knobs shared by the PRISM listeners:
 | `PRISM_BLOCKPOLL_SECONDS` | `2` | fallback qbit tip/template poll interval |
 | `PRISM_BLOCKWAIT_ENABLED` | `1` | enables a `waitfornewblock` thread so new tips trigger immediate clean-job refreshes |
 | `PRISM_BLOCKWAIT_TIMEOUT_SECONDS` | `5` | server-side timeout for each `waitfornewblock` call |
+| `PRISM_BUNDLE_BUILD_TIMEOUT_SECONDS` | `60` | fail-closed timeout for one signed shared-bundle subprocess |
+| `PRISM_COORDINATION_BLOCKED_EXIT_SECONDS` | `900` | maximum continuous age of coordination-only template-refresh deferrals before the publication watchdog restarts the coordinator |
+| `PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS` | `15` | maximum monotonic age of a known tip/template/payout refresh before `/healthz` returns HTTP 503 |
+| `PRISM_INITIAL_JOB_MAX_WORKERS` | `4` | dedicated first-job delivery workers; raise under sustained reconnect churn so first notifies do not queue behind each other; explicit values above `PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS` are rejected, while the implicit default caps itself to that bound |
+| `PRISM_JOB_BUILD_EXECUTOR_WORKERS` | `2` | shared job-build executor threads; the scheduler admits at most two concurrent flights, so values above `2` are rejected — lower to `1` to serialize builds on constrained hosts |
+| `PRISM_OBSERVED_TIP_ACCEPT_WINDOW_SECONDS` | `300` | how long an own-hash tip observation (blockwait/blockpoll seeing a pool block candidate as the chain tip) keeps protecting that candidate from terminal abandonment while fresh chain probes cannot prove it active; expired windows restore terminal stale abandons |
+| `PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS` | `15` | maximum monotonic age of the last coherent qbit tip/template poll before `/healthz` returns HTTP 503 |
+| `PRISM_TIP_REFRESH_FAILURE_HOLDOFF_SECONDS` | `1` | minimum spacing (plus up to 25% jitter) between failed tip-refresh attempts while the observed tip is unchanged; success or a new tip re-arms immediately; set `0` for unspaced retries |
+| `PRISM_TIP_REFRESH_EPOCH_FANOUT` | `0` | enables latest-wins refresh epochs; leave disabled for legacy abort-and-retry behavior, enable gradually, and set back to `0` to roll back |
 | `PRISM_STRATUM_STALE_GRACE_SECONDS` | `3` | after a tip flip, credits same-connection prior-tip shares until this long after that connection receives new-tip work (shares stay creditable while delivery is still pending); set `0` to reject all prior-tip shares |
 | `PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS` | `15` | cadence for checking zero-submitted, zero-accepted vardiff windows so over-diffed idle miners can step down; set `0` to disable |
 | `PRISM_WORKER_METRICS_LIMIT` | `100` | maximum distinct worker labels in private metrics before new workers aggregate into `_other` |
+
+`/healthz` remains healthy across arbitrarily long periods without a new block
+when the observed template and payout generation are unchanged. It returns HTTP
+503 only when tip polling is stale, an active bundle build is stuck, or known
+new work is not published (and, when eligible miners exist, delivered) within
+the configured bounds. The response and Prometheus metrics expose only bounded
+generation, age, client-count, and reason fields; miner identities and work
+payloads are never included.
+
+The Compose healthcheck samples `/healthz` every five seconds and marks the
+container unhealthy after three consecutive failures. This is an alerting
+signal only: Compose `restart: on-failure` restarts coordinator process exits,
+not containers whose health status alone becomes unhealthy. Use `/healthz` or
+the `qbit_prism_health_state` metrics for alerting and automation.
 
 Stale-grace crediting never submits a block candidate. The submitted header must
 still satisfy the assigned share target, is marked with `credit_policy:
@@ -230,6 +286,21 @@ verifiers before enabling a non-zero stale-grace window in production.
 8. The builder emits a deterministic P2MR coinbase and signed payout manifest.
 9. The coordinator submits the block to qbit and persists the block, payout
    rows, audit bundle, and settlement artifacts.
+
+The `8 * network_difficulty` rule defines a work window, not a fixed wall-clock
+period. qbit's permissionless lane targets one block every 75 seconds, so eight
+network-difficulty units correspond to a nominal 600 seconds (10 minutes) when
+the pool has all permissionless hashrate. If the pool has fraction `p` of that
+hashrate, the expected span is `600 / p` seconds, equivalently eight times the
+pool's expected permissionless block time. The observed span can be shorter or
+longer as pool hashrate, vardiff, and share timing change. It is separate from
+the coinbase-maturity delay.
+
+The public live reward leaderboard anchors at its snapshot time and uses the
+current permissionless difficulty, making it a prospective next-block view.
+Every found block instead freezes its own window at that job's issue time and
+difficulty; its audit bundle is the authoritative historical record. Startup
+collection jobs remain the exception described below.
 
 Eligibility is intentionally strict. A share can enter the found block's window
 only when both `job_issued_at <= anchor_job_issued_at` and
@@ -277,6 +348,41 @@ replaying active carry-forward deltas.
 Pool fees are optional. When enabled, configure `PRISM_POOL_FEE_ENABLED`,
 `PRISM_POOL_FEE_BPS`, and either `PRISM_POOL_FEE_ADDRESS` or
 `PRISM_POOL_FEE_P2MR_PROGRAM_HEX`.
+
+### Coinbase Output Ordering
+
+Coinbase payout outputs are ordered lexicographically by
+`(order_key, recipient_id, p2mr_program_hex)`, with the zero-value witness
+commitment always last. Miner outputs use the payout address as `order_key`,
+and CTV covenant outputs use synthetic `ctv-fanout-<index>` keys, so the pool
+fee lands wherever its `order_key` happens to sort and can even route through a
+CTV fanout chunk. `PRISM_COINBASE_OUTPUT_POLICY` makes the ordering rule
+explicit:
+
+```text
+PRISM_COINBASE_OUTPUT_POLICY=canonical|pool-fee-first
+```
+
+- **`canonical`** (default) preserves the historical ordering exactly.
+- **`pool-fee-first`** requires an enabled pool fee and, whenever the fee
+  output is positive, reserves one direct coinbase settlement slot for it,
+  never routes the fee through CTV fanout, and emits the fee at coinbase
+  `vout 0`. Direct miner and CTV covenant outputs keep canonical ordering
+  after it, and the witness commitment stays last. A sub-floor fee is still
+  settled directly, and job construction fails instead of demoting the fee
+  when the settlement output budget cannot hold the reserved slot.
+
+Unknown values are rejected at startup. The selected policy is committed in
+the payout policy manifest (and therefore in the on-chain audit commitment and
+signed audit bundle), so independent verifiers and downstream indexers can
+determine the intended ordering without operator-local environment
+configuration; `qbit-prism-audit-verify` enforces it and reports it as
+`coinbase_output_policy`.
+
+Switching policies changes the coinbase txid, manifest hashes, and CTV parent
+vouts prospectively, at job-construction time only. Blocks and persisted CTV
+artifacts built under the previous policy continue to verify under their
+original ordering.
 
 ## Direct Coinbase Settlement
 
@@ -600,6 +706,7 @@ Broadcaster:
 ```text
 PRISM_CTV_BROADCASTER_ENABLED=1
 PRISM_CTV_BROADCASTER_LIMIT=100
+PRISM_CTV_BROADCASTER_CHUNK_SIZE=5
 PRISM_CTV_BROADCASTER_INTERVAL_SECONDS=30
 PRISM_CTV_BROADCASTER_FEE_BITS=0
 ```

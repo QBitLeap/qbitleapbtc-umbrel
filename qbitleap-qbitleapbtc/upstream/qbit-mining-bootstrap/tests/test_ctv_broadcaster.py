@@ -17,6 +17,7 @@ from lab.prism.ctv_broadcaster import (
     CtvFanoutBroadcaster,
     FanoutArtifact,
     RpcError,
+    WriterLeaseRenewalDeferred,
     build_unsigned_cpfp_child,
 )
 
@@ -250,6 +251,87 @@ class SettlementStatusTests(unittest.TestCase):
 
 
 class BroadcastTests(unittest.TestCase):
+    def test_mutating_wallet_and_node_rpcs_are_lease_fenced(self) -> None:
+        fake = FakeRpc(tip=100 + MATURITY)
+        fenced_operations: list[str] = []
+        engine = CtvFanoutBroadcaster(
+            fake,
+            funding_wallet="broadcaster",
+            maturity=MATURITY,
+            before_external_side_effect=fenced_operations.append,
+        )
+
+        attempt = engine.broadcast(artifact(), fee_sats=50_000)
+
+        self.assertTrue(attempt.submitted)
+        self.assertEqual(
+            fenced_operations,
+            [
+                "ctv_wallet_getnewaddress",
+                "ctv_wallet_sign",
+                "ctv_submitpackage",
+            ],
+        )
+
+    def test_stale_lease_gate_prevents_ctv_external_side_effect(self) -> None:
+        fake = FakeRpc(tip=100 + MATURITY)
+
+        def refuse(_operation: str) -> None:
+            raise RuntimeError("writer guard stale")
+
+        engine = CtvFanoutBroadcaster(
+            fake,
+            funding_wallet="broadcaster",
+            maturity=MATURITY,
+            before_external_side_effect=refuse,
+        )
+
+        attempt = engine.broadcast(artifact(), fee_sats=50_000)
+
+        self.assertFalse(attempt.submitted)
+        self.assertIn("writer guard stale", attempt.detail)
+        self.assertEqual(fake.submitted_packages, [])
+        self.assertEqual(fake.submitted_raw_transactions, [])
+
+    def test_lease_renewal_deferral_propagates_instead_of_becoming_an_attempt(
+        self,
+    ) -> None:
+        """The fence's deferral is a preflight refusal, not a broadcast outcome.
+
+        Converting WriterLeaseRenewalDeferred into an error attempt would
+        journal a failure and push the payout behind the persistent retry
+        backoff, while the deferral is transient by design: the daemon's
+        caller retries on its ordinary pass interval once the deferring
+        write commits. The exception must pass through the generic
+        RPC-error conversion, with no RPC sent.
+        """
+        fake = FakeRpc(tip=100 + MATURITY)
+
+        def defer(_operation: str) -> None:
+            raise WriterLeaseRenewalDeferred("renewal is deferred")
+
+        engine = CtvFanoutBroadcaster(
+            fake,
+            funding_wallet="broadcaster",
+            maturity=MATURITY,
+            before_external_side_effect=defer,
+        )
+
+        with self.assertRaisesRegex(
+            WriterLeaseRenewalDeferred,
+            "renewal is deferred",
+        ):
+            engine.broadcast(artifact(), fee_sats=50_000)
+        self.assertEqual(fake.submitted_packages, [])
+        self.assertEqual(fake.submitted_raw_transactions, [])
+
+        with self.assertRaisesRegex(
+            WriterLeaseRenewalDeferred,
+            "renewal is deferred",
+        ):
+            engine.broadcast(no_anchor_artifact(), fee_sats=0)
+        self.assertEqual(fake.submitted_raw_transactions, [])
+
     def test_broadcasts_when_broadcastable(self) -> None:
         fake = FakeRpc(tip=100 + MATURITY)
         attempt = broadcaster(fake).broadcast(artifact(), fee_sats=50_000)

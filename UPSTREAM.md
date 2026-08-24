@@ -4,7 +4,7 @@ The vendored mining stack in
 `qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap/` is an unmodified copy of:
 
 - Repository: `https://github.com/Qbit-Org/qbit-mining-bootstrap.git`
-- Commit: `2cd9fa4049c2064e34285de77cce4c0731fe657d`
+- Commit: `f28a6bf46afd73de42842e7ca6732b27ac58c25d`
 - Upstream branch at import: `main`
 - Upstream-reported version: `1.0.0`
 

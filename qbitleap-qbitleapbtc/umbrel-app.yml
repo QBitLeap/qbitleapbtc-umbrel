@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.5.2"
+version: "0.5.3"
 port: 8080
 
 description: >-
@@ -24,7 +24,7 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 
 gallery: []
 
-releaseNotes: "Show node synchronization state, progress, and availability in the dashboard."
+releaseNotes: "Automatically synced qbit-mining-bootstrap upstream to f28a6bf46afd."
 
 dependencies:
   - bitcoin

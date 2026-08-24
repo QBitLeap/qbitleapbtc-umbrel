@@ -1,7 +1,7 @@
 use qbit_pool_builder::ManifestSigningKey;
 use qbit_prism::{
     build_audit_bundle, canonical_audit_bundle_bytes, verify_audit_bundle, AcceptedShare,
-    AuditBundle, CarryForwardBalance, FoundBlock, PayoutPolicy,
+    AuditBundle, CarryForwardBalance, CoinbaseOutputPolicy, FoundBlock, PayoutPolicy,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -278,6 +278,180 @@ fn canonicalize_cli_emits_verifier_hash_bytes() {
     );
     let reparsed: AuditBundle = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(reparsed, bundle);
+}
+
+#[test]
+fn build_audit_bundle_cli_canonical_output_matches_cc5_golden_bytes() {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../fixtures/power-law-accrual.prism-fixture.json"
+    ))
+    .unwrap();
+    let expected_bundle = build_audit_bundle(
+        fixture.shares,
+        fixture.found_block,
+        power_law_prior_balances(),
+        PayoutPolicy::day_one_default(),
+        &manifest_signing_key(),
+        &ledger_signing_key(),
+    )
+    .unwrap();
+    let mut input: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/power-law-accrual.prism-fixture.json"
+    ))
+    .unwrap();
+    input["prior_balances"] = serde_json::to_value(power_law_prior_balances()).unwrap();
+    let input_path = std::env::temp_dir().join(format!(
+        "qbit-prism-build-audit-bundle-canonical-input-{}.json",
+        std::process::id()
+    ));
+    fs::write(&input_path, serde_json::to_vec(&input).unwrap()).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .arg("--canonical-output")
+        .output()
+        .unwrap();
+    let summary_output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .arg("--job-summary-output")
+        .output()
+        .unwrap();
+    let mut compact_input = input.clone();
+    let mut compact_identities = Vec::<serde_json::Value>::new();
+    let mut compact_shares = Vec::<serde_json::Value>::new();
+    for share in input["shares"].as_array().unwrap() {
+        let identity = serde_json::json!([
+            share["miner_id"],
+            share["order_key"],
+            share["p2mr_program_hex"],
+        ]);
+        let identity_index = compact_identities
+            .iter()
+            .position(|candidate| candidate == &identity)
+            .unwrap_or_else(|| {
+                compact_identities.push(identity);
+                compact_identities.len() - 1
+            });
+        compact_shares.push(serde_json::json!([
+            share["share_seq"],
+            share["share_id"],
+            identity_index,
+            share["share_difficulty"],
+            share["job_issued_at_ms"],
+            share["accepted_at_ms"],
+            share
+                .get("credit_policy")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ]));
+    }
+    compact_input["shares"] = serde_json::json!([]);
+    compact_input["compact_share_identities"] = serde_json::Value::Array(compact_identities);
+    compact_input["compact_shares"] = serde_json::Value::Array(compact_shares);
+    fs::write(&input_path, serde_json::to_vec(&compact_input).unwrap()).unwrap();
+    let compact_summary_output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .arg("--job-summary-output")
+        .arg("--phase-metrics")
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&input_path);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        canonical_audit_bundle_bytes(&expected_bundle).unwrap()
+    );
+    let emitted_bundle: AuditBundle = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(emitted_bundle, expected_bundle);
+
+    assert!(
+        summary_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&summary_output.stdout),
+        String::from_utf8_lossy(&summary_output.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&summary_output.stdout).unwrap();
+    let summary_fields = summary.as_object().unwrap();
+    assert_eq!(
+        summary_fields
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "found_block",
+            "payout_policy_manifest",
+            "signed_coinbase_manifest",
+        ]
+    );
+    assert_eq!(
+        summary,
+        serde_json::json!({
+            "found_block": &expected_bundle.found_block,
+            "signed_coinbase_manifest": &expected_bundle.signed_coinbase_manifest,
+            "payout_policy_manifest": &expected_bundle.payout_policy_manifest,
+        })
+    );
+    assert!(summary.get("shares").is_none());
+    assert!(summary.get("reward_manifest").is_none());
+    assert!(
+        compact_summary_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&compact_summary_output.stdout),
+        String::from_utf8_lossy(&compact_summary_output.stderr)
+    );
+    assert_eq!(compact_summary_output.stdout, summary_output.stdout);
+    assert!(String::from_utf8_lossy(&compact_summary_output.stderr)
+        .contains("qbit-prism-build-phase-metrics"));
+
+    let report = verify_audit_bundle(&emitted_bundle, &ledger_public_key_hex()).unwrap();
+    assert_eq!(output.stdout.len(), 10_999);
+    assert_eq!(
+        hex::encode(Sha256::digest(&output.stdout)),
+        "65b11e1b7e2025472fad2e4cd6b555eaba5eab2a4903e17179ba792d58780a4b"
+    );
+    assert_eq!(
+        report.reward_manifest_sha256_hex,
+        "14feb3360ba2d97faadf178151ca7c09bbb6a6e59e6c39a079e7d97986357ae1"
+    );
+    assert_eq!(
+        report.payout_policy_manifest_sha256_hex,
+        "2db25eb6db270fb0e5ef9100158b2bfcca95ae6228717fb9779de47fbe11a668"
+    );
+    assert_eq!(
+        report.coinbase_manifest_sha256_hex,
+        "635e6133c760cbed7965b0475a273a82495141b4e3939a9908441baa532a0c39"
+    );
+    assert_eq!(
+        emitted_bundle.reward_manifest.share_slice_digest_hex,
+        "fc39e87eaedeb6cb6442afbdf060ddc81a93846acc3ffdb47cf202c408c6a9d3"
+    );
+    assert_eq!(
+        report.audit_commitment_root_hex,
+        "492c8e5f83049d3f6b04a175a531f130a8c52c2fa944b06741f442587f365d3a"
+    );
+    assert_eq!(report.onchain_output_count, 3);
+    assert_eq!(report.accrued_account_count, 3);
 }
 
 #[test]
@@ -720,6 +894,147 @@ fn build_audit_bundle_cli_emits_ctv_settlement_bundle() {
     assert!(!bundle.witness_merkle_leaves_hex.contains(fanout_leaf));
 }
 
+fn pool_fee_first_cli_input(coinbase_output_policy: &str) -> serde_json::Value {
+    serde_json::json!({
+        "shares": [
+            {
+                "share_seq": 1,
+                "share_id": "share-1",
+                "miner_id": "miner-a",
+                "order_key": "01",
+                "p2mr_program_hex": "01".repeat(32),
+                "share_difficulty": 3,
+                "network_difficulty": 5,
+                "template_height": 100,
+                "job_id": "job-1",
+                "job_issued_at_ms": 1000,
+                "accepted_at_ms": 1000,
+                "ntime": 1800000000
+            },
+            {
+                "share_seq": 2,
+                "share_id": "share-2",
+                "miner_id": "miner-b",
+                "order_key": "02",
+                "p2mr_program_hex": "02".repeat(32),
+                "share_difficulty": 2,
+                "network_difficulty": 5,
+                "template_height": 100,
+                "job_id": "job-1",
+                "job_issued_at_ms": 1000,
+                "accepted_at_ms": 1000,
+                "ntime": 1800000000
+            }
+        ],
+        "found_block": {
+            "block_height": 101,
+            "coinbase_value_sats": 1000000,
+            "network_difficulty": 5,
+            "anchor_job_issued_at_ms": 1000
+        },
+        "payout_policy": {
+            "p2mr_spend_input_bytes": 3680,
+            "target_feerate_sats_per_byte": 1,
+            "safety_multiplier": 4,
+            "pool_fee_policy": {
+                "fee_bps": 200,
+                "recipient_id": "pool-fee",
+                "order_key": "zzzzzzzz",
+                "p2mr_program_hex": "ff".repeat(32)
+            },
+            "coinbase_output_policy": coinbase_output_policy
+        },
+        "coinbase_script_sig_suffix_hex": "aaaaaaaa",
+        "ctv_settlement": {
+            "direct_floor_sats": 50000,
+            "config": {
+                "max_coinbase_settlement_outputs": 16,
+                "max_direct_coinbase_outputs": 2,
+                "max_fanout_recipients_per_transaction": 10,
+                "reserved_coinbase_outputs": 0
+            }
+        }
+    })
+}
+
+fn run_build_audit_bundle_cli(input: &serde_json::Value, tag: &str) -> std::process::Output {
+    let input_path = std::env::temp_dir().join(format!(
+        "qbit-prism-build-audit-bundle-{tag}-input-{}.json",
+        std::process::id()
+    ));
+    fs::write(&input_path, serde_json::to_vec(input).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&input_path);
+    output
+}
+
+#[test]
+fn build_audit_bundle_cli_honors_pool_fee_first_output_policy() {
+    let output = run_build_audit_bundle_cli(
+        &pool_fee_first_cli_input("pool-fee-first"),
+        "pool-fee-first",
+    );
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bundle: AuditBundle = serde_json::from_slice(&output.stdout).unwrap();
+    let report = verify_audit_bundle(&bundle, &ledger_public_key_hex()).unwrap();
+
+    assert_eq!(
+        bundle.payout_policy_manifest.coinbase_output_policy,
+        CoinbaseOutputPolicy::PoolFeeFirst
+    );
+    assert_eq!(
+        report.coinbase_output_policy,
+        CoinbaseOutputPolicy::PoolFeeFirst
+    );
+    let outputs = &bundle.signed_coinbase_manifest.manifest.outputs;
+    assert_eq!(outputs[0].recipient_id, "pool-fee");
+    assert_eq!(outputs[0].vout, 0);
+    assert_eq!(outputs[0].amount_sats, 20_000);
+    let serialized_bundle = String::from_utf8(output.stdout).unwrap();
+    assert!(serialized_bundle.contains("\"coinbase_output_policy\": \"pool-fee-first\""));
+}
+
+#[test]
+fn build_audit_bundle_cli_rejects_unknown_coinbase_output_policy() {
+    let output = run_build_audit_bundle_cli(&pool_fee_first_cli_input("fee-first"), "bad-policy");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        stderr.contains("unknown variant") && stderr.contains("pool-fee-first"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn build_audit_bundle_cli_rejects_pool_fee_first_without_pool_fee_policy() {
+    let mut input = pool_fee_first_cli_input("pool-fee-first");
+    input["payout_policy"]
+        .as_object_mut()
+        .unwrap()
+        .remove("pool_fee_policy");
+
+    let output = run_build_audit_bundle_cli(&input, "pool-fee-first-no-fee");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        stderr.contains("pool-fee-first coinbase output policy requires a configured pool fee"),
+        "stderr: {stderr}"
+    );
+}
+
 #[test]
 fn reorg_verify_cli_reverses_disconnected_immature_entries() {
     let fixture: Fixture = serde_json::from_str(include_str!(
@@ -779,4 +1094,191 @@ fn reorg_verify_cli_reverses_disconnected_immature_entries() {
         report["reversed_entry_count"]
     );
     assert!(report["replacement_entry_count"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn build_audit_bundle_serve_mode_caches_parsed_windows() {
+    use std::io::{BufRead, BufReader as StdBufReader, Write as IoWrite};
+    use std::process::Stdio;
+
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/power-law-accrual.prism-fixture.json"
+    ))
+    .unwrap();
+    let mut compact_identities = Vec::<serde_json::Value>::new();
+    let mut compact_shares = Vec::<serde_json::Value>::new();
+    for share in fixture["shares"].as_array().unwrap() {
+        let identity = serde_json::json!([
+            share["miner_id"],
+            share["order_key"],
+            share["p2mr_program_hex"],
+        ]);
+        let identity_index = compact_identities
+            .iter()
+            .position(|candidate| candidate == &identity)
+            .unwrap_or_else(|| {
+                compact_identities.push(identity);
+                compact_identities.len() - 1
+            });
+        compact_shares.push(serde_json::json!([
+            share["share_seq"],
+            share["share_id"],
+            identity_index,
+            share["share_difficulty"],
+            share["job_issued_at_ms"],
+            share["accepted_at_ms"],
+            share
+                .get("credit_policy")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ]));
+    }
+    let build_fields = serde_json::json!({
+        "found_block": fixture["found_block"],
+        "prior_balances": serde_json::to_value(power_law_prior_balances()).unwrap(),
+    });
+
+    let one_shot_input = {
+        let mut input = build_fields.clone();
+        input["shares"] = serde_json::json!([]);
+        input["compact_share_identities"] =
+            serde_json::Value::Array(compact_identities.clone());
+        input["compact_shares"] = serde_json::Value::Array(compact_shares.clone());
+        input
+    };
+    let one_shot_path = std::env::temp_dir().join(format!(
+        "qbit-prism-serve-one-shot-input-{}.json",
+        std::process::id()
+    ));
+    fs::write(&one_shot_path, serde_json::to_vec(&one_shot_input).unwrap()).unwrap();
+    let one_shot = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--input")
+        .arg(&one_shot_path)
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .arg("--job-summary-output")
+        .output()
+        .unwrap();
+    let _ = fs::remove_file(&one_shot_path);
+    assert!(
+        one_shot.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&one_shot.stderr)
+    );
+    let expected_summary: serde_json::Value =
+        serde_json::from_slice(&one_shot.stdout).unwrap();
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_qbit-prism-build-audit-bundle"))
+        .arg("--serve")
+        .arg("--signing-key-seed-hex")
+        .arg("42".repeat(32))
+        .arg("--ledger-signing-key-seed-hex")
+        .arg("43".repeat(32))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = daemon.stdin.take().unwrap();
+    let mut stdout = StdBufReader::new(daemon.stdout.take().unwrap());
+
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let handshake: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(handshake["event"], "handshake");
+    assert_eq!(handshake["protocol"], 1);
+    assert_eq!(handshake["tool"], "qbit-prism-build-audit-bundle");
+
+    let mut request_with_window = build_fields.clone();
+    request_with_window["window_key"] =
+        serde_json::json!({"share_snapshot_sha256": "window-a"});
+    request_with_window["compact_share_identities"] =
+        serde_json::Value::Array(compact_identities.clone());
+    request_with_window["compact_shares"] = serde_json::Value::Array(compact_shares.clone());
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::to_string(&request_with_window).unwrap()
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let uploaded: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(uploaded["ok"], true, "upload response: {line}");
+    assert_eq!(uploaded["summary"], expected_summary);
+    assert_eq!(uploaded["window_cache"]["hit"], false);
+    assert_eq!(uploaded["window_cache"]["misses"], 1);
+    assert_eq!(uploaded["window_cache"]["entries"], 1);
+    assert!(uploaded["metrics"]["input_deserialization_seconds"]
+        .as_f64()
+        .is_some());
+    assert!(uploaded["metrics"]["output_serialization_seconds"]
+        .as_f64()
+        .is_some());
+    assert!(uploaded["metrics"]["phases_seconds"].is_object());
+
+    let mut request_cached = build_fields.clone();
+    request_cached["window_key"] = serde_json::json!({"share_snapshot_sha256": "window-a"});
+    writeln!(stdin, "{}", serde_json::to_string(&request_cached).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let hit: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(hit["ok"], true, "hit response: {line}");
+    assert_eq!(hit["summary"], expected_summary);
+    assert_eq!(hit["window_cache"]["hit"], true);
+    assert_eq!(hit["window_cache"]["hits"], 1);
+
+    let mut request_unknown = build_fields.clone();
+    request_unknown["window_key"] =
+        serde_json::json!({"share_snapshot_sha256": "window-unknown"});
+    writeln!(stdin, "{}", serde_json::to_string(&request_unknown).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let missing: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(missing["ok"], false);
+    assert_eq!(missing["needs_window"], true);
+
+    // Identities without shares are rejected like one-shot mode, and never
+    // classified as a cache hit or a window that needs uploading.
+    let mut request_identities_only = build_fields.clone();
+    request_identities_only["window_key"] =
+        serde_json::json!({"share_snapshot_sha256": "window-a"});
+    request_identities_only["compact_share_identities"] =
+        serde_json::Value::Array(compact_identities.clone());
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::to_string(&request_identities_only).unwrap()
+    )
+    .unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let identities_only: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(identities_only["ok"], false);
+    assert_eq!(identities_only["needs_window"], false);
+
+    // Two fresh uploads bound the cache to the most recent generations and
+    // evict window-a.
+    for name in ["window-b", "window-c"] {
+        let mut request = request_with_window.clone();
+        request["window_key"] = serde_json::json!({"share_snapshot_sha256": name});
+        writeln!(stdin, "{}", serde_json::to_string(&request).unwrap()).unwrap();
+        line.clear();
+        stdout.read_line(&mut line).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["ok"], true, "upload response: {line}");
+        assert!(response["window_cache"]["entries"].as_u64().unwrap() <= 2);
+    }
+    writeln!(stdin, "{}", serde_json::to_string(&request_cached).unwrap()).unwrap();
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let evicted: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(evicted["ok"], false);
+    assert_eq!(evicted["needs_window"], true);
+
+    drop(stdin);
+    let status = daemon.wait().unwrap();
+    assert!(status.success());
 }

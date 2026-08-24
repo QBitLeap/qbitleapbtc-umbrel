@@ -47,6 +47,9 @@ jobs:
       - name: Run Postgres ledger integration tests
         run: make test-prism-postgres-ledger
 
+      - name: Run Postgres production-scale fixture tests
+        run: make test-prism-postgres-scale
+
       - name: Validate mainnet Compose contract
         run: python -m unittest tests.test_mainnet_compose_contract
 
@@ -66,6 +69,53 @@ jobs:
               --profile "$profile" \
               config --quiet
           done
+
+  ckpool-rejects-observability:
+    name: ckpool rejects observability live suite
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install ckpool build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake build-essential libtool pkgconf yasm \
+            libcurl4-openssl-dev libjansson-dev libzmq3-dev
+
+      - name: Build patched ckpool and run live regression and load tests
+        run: make test-ckpool-rejects-observability
+
+  postgres-native-client:
+    name: PostgreSQL ledger API with production psycopg
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install production PostgreSQL client dependency
+        run: python -m pip install "psycopg[binary]==3.2.*"
+
+      - name: Run complete share-ledger API suite with psycopg installed
+        run: python -m unittest tests.test_prism_share_ledger
+
+      - name: Run native PostgreSQL ledger integration tests
+        run: make test-prism-postgres-native-ledger
 
   docker-builds:
     name: Build lightweight Docker images

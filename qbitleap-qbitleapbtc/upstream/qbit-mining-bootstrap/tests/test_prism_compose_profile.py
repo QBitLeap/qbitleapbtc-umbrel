@@ -50,24 +50,34 @@ class PrismComposeProfileTests(unittest.TestCase):
                 "PRISM_RESERVED_COINBASE_OUTPUTS": "1",
                 "PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT": "25",
                 "PRISM_CTV_FANOUT_FEE_PREMIUM_BPS": "13000",
+                "PRISM_COINBASE_OUTPUT_POLICY": "pool-fee-first",
                 "PRISM_CTV_BROADCASTER_ENABLED": "1",
                 "PRISM_CTV_BROADCASTER_WALLET": "fanout-broadcaster",
                 "PRISM_CTV_BROADCASTER_FEE_BITS": "0",
                 "PRISM_CTV_BROADCASTER_LIMIT": "7",
+                "PRISM_CTV_BROADCASTER_CHUNK_SIZE": "3",
                 "PRISM_CTV_BROADCASTER_INTERVAL_SECONDS": "11",
                 "PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT": "9",
                 "PRISM_CTV_BROADCAST_RETRY_BACKOFF_SECONDS": "17",
                 "PRISM_BLOCKWAIT_ENABLED": "0",
                 "PRISM_BLOCKWAIT_TIMEOUT_SECONDS": "13",
+                "PRISM_COORDINATION_BLOCKED_EXIT_SECONDS": "37",
+                "PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS": "23",
+                "PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS": "29",
                 "PRISM_STRATUM_STALE_GRACE_SECONDS": "4",
                 "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS": "31",
                 "PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION": "65",
+                "PRISM_TIP_REFRESH_EPOCH_FANOUT": "1",
                 "PRISM_TIP_REFRESH_MAX_WORKERS": "7",
                 "PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS": "19",
                 "PRISM_WORKER_METRICS_LIMIT": "8",
                 "PRISM_STRATUM_MAX_CONNECTIONS": "1900",
                 "PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME": "400",
+                "PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS": "120",
+                "PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS": "27",
+                "PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS": "29",
                 "PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS": "2",
+                "PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS": "9",
                 "PRISM_PAYOUT_ADDRESS_CACHE_MAX_ENTRIES": "2048",
                 "PRISM_PAYOUT_ADDRESS_CACHE_TTL_SECONDS": "1800",
                 "PRISM_COORDINATOR_NOFILE_SOFT": "60000",
@@ -140,22 +150,30 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_POSTGRES_INIT_SCHEMA"], "1")
         self.assertEqual(env["PRISM_POSTGRES_READ_CONCURRENCY"], "4")
         self.assertEqual(env["PRISM_LEDGER_LEASE_TTL_SECONDS"], "60")
+        self.assertEqual(env["PRISM_WRITER_QUIESCENCE_TIMEOUT_SECONDS"], "9")
         self.assertEqual(env["PRISM_WATCHDOG_ENABLED"], "1")
         self.assertEqual(env["PRISM_WATCHDOG_TIMEOUT_SECONDS"], "120")
         self.assertEqual(env["PRISM_WATCHDOG_INTERVAL_SECONDS"], "15")
         self.assertEqual(env["PRISM_BLOCKWAIT_ENABLED"], "0")
         self.assertEqual(env["PRISM_BLOCKWAIT_TIMEOUT_SECONDS"], "13")
+        self.assertEqual(env["PRISM_COORDINATION_BLOCKED_EXIT_SECONDS"], "37")
+        self.assertEqual(env["PRISM_HEALTH_PENDING_REFRESH_MAX_AGE_SECONDS"], "23")
+        self.assertEqual(env["PRISM_HEALTH_TIP_POLL_MAX_AGE_SECONDS"], "29")
         self.assertEqual(env["PRISM_STRATUM_STALE_GRACE_SECONDS"], "4")
         self.assertEqual(env["PRISM_STRATUM_SAME_TIP_JOB_RETENTION_SECONDS"], "31")
         self.assertEqual(
             env["PRISM_STRATUM_SAME_TIP_JOB_RETENTION_PER_CONNECTION"],
             "65",
         )
+        self.assertEqual(env["PRISM_TIP_REFRESH_EPOCH_FANOUT"], "1")
         self.assertEqual(env["PRISM_TIP_REFRESH_MAX_WORKERS"], "7")
         self.assertEqual(env["PRISM_STRATUM_VARDIFF_IDLE_SWEEP_SECONDS"], "19")
         self.assertEqual(env["PRISM_WORKER_METRICS_LIMIT"], "8")
         self.assertEqual(env["PRISM_STRATUM_MAX_CONNECTIONS"], "1900")
         self.assertEqual(env["PRISM_STRATUM_MAX_CONNECTIONS_PER_USERNAME"], "400")
+        self.assertEqual(env["PRISM_STRATUM_MAX_PENDING_INITIAL_JOBS"], "120")
+        self.assertEqual(env["PRISM_STRATUM_INITIAL_JOB_TIMEOUT_SECONDS"], "27")
+        self.assertEqual(env["PRISM_MINING_HEALTH_STARTUP_GRACE_SECONDS"], "29")
         self.assertEqual(
             env["PRISM_STRATUM_ACCEPT_RESOURCE_EXHAUSTION_BACKOFF_SECONDS"],
             "2",
@@ -170,6 +188,9 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_PUBLIC_CACHE_ENABLED"], "1")
         self.assertEqual(env["PRISM_PUBLIC_CACHE_TTL_SECONDS"], "5")
         self.assertEqual(env["PRISM_PUBLIC_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "30")
+        self.assertEqual(env["PRISM_PUBLIC_AGGREGATE_CACHE_TTL_SECONDS"], "30")
+        self.assertEqual(env["PRISM_PUBLIC_AGGREGATE_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "30")
+        self.assertEqual(env["PRISM_PUBLIC_REWARD_WINDOW_CACHE_SECONDS"], "30")
         self.assertEqual(env["PRISM_PUBLIC_CONFIG_CACHE_TTL_SECONDS"], "300")
         self.assertEqual(env["PRISM_PUBLIC_CONFIG_CACHE_STALE_WHILE_REVALIDATE_SECONDS"], "3600")
         self.assertEqual(env["PRISM_PUBLIC_ARTIFACT_CACHE_TTL_SECONDS"], "86400")
@@ -191,10 +212,12 @@ class PrismComposeProfileTests(unittest.TestCase):
         self.assertEqual(env["PRISM_RESERVED_COINBASE_OUTPUTS"], "1")
         self.assertEqual(env["PRISM_CTV_FANOUT_FEE_MARKET_RATE_BITS_PER_1000_WEIGHT"], "25")
         self.assertEqual(env["PRISM_CTV_FANOUT_FEE_PREMIUM_BPS"], "13000")
+        self.assertEqual(env["PRISM_COINBASE_OUTPUT_POLICY"], "pool-fee-first")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_ENABLED"], "1")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_WALLET"], "fanout-broadcaster")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_FEE_BITS"], "0")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_LIMIT"], "7")
+        self.assertEqual(env["PRISM_CTV_BROADCASTER_CHUNK_SIZE"], "3")
         self.assertEqual(env["PRISM_CTV_BROADCASTER_INTERVAL_SECONDS"], "11")
         self.assertEqual(env["PRISM_CTV_BROADCAST_ATTEMPT_DETAIL_LIMIT"], "9")
         self.assertEqual(env["PRISM_CTV_BROADCAST_RETRY_BACKOFF_SECONDS"], "17")
@@ -237,6 +260,17 @@ class PrismComposeProfileTests(unittest.TestCase):
         # stopped. Postgres should still come back after daemon/host restarts.
         self.assertEqual(self.config["services"]["prism-coordinator"].get("restart"), "on-failure")
         self.assertEqual(self.config["services"]["prism-postgres"].get("restart"), "unless-stopped")
+
+    def test_prism_healthcheck_propagates_http_503_failure(self) -> None:
+        healthcheck = self.config["services"]["prism-coordinator"]["healthcheck"]
+        command = " ".join(healthcheck["test"])
+
+        # urllib raises HTTPError for a 503, so the container command exits
+        # non-zero instead of treating any HTTP response as healthy.
+        self.assertIn("/healthz", command)
+        self.assertIn("urllib.request.urlopen", command)
+        self.assertEqual(healthcheck["start_period"], "15s")
+        self.assertEqual(healthcheck["retries"], 3)
 
     def test_prism_coordinator_descriptor_limit_is_configurable(self) -> None:
         nofile = self.config["services"]["prism-coordinator"]["ulimits"]["nofile"]

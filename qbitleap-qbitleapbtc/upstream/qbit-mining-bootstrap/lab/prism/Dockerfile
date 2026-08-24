@@ -12,6 +12,10 @@ RUN apt-get update \
         rustc \
     && rm -rf /var/lib/apt/lists/*
 
+# Persistent pooled Postgres client for the share-ledger hot path. The psql
+# binary stays installed as the fallback backend (PRISM_POSTGRES_NATIVE_CLIENT=0).
+RUN pip install --no-cache-dir "psycopg[binary]==3.2.*"
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY lab/auxpow/ ./lab/auxpow/
@@ -26,4 +30,6 @@ RUN cargo build --locked --release -p qbit-prism --bins
 
 ENV PRISM_TOOL_BIN_DIR=/app/target/release
 
+# Keep Python as PID 1 so watchdog os._exit(1) reaches Docker unchanged. Any
+# future wrapper must exec the coordinator or explicitly propagate its status.
 CMD ["python3", "-m", "lab.prism.prism_coordinator"]
