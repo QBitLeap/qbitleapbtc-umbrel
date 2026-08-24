@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -62,6 +63,25 @@ jobs:
           printf '%s\n' "${UPSTREAM_COMMIT}" > UPSTREAM_COMMIT
           sed -i "s/${PINNED_COMMIT}/${UPSTREAM_COMMIT}/g" UPSTREAM.md
 
+      - name: Bump Umbrel app version
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="qbitleap-qbitleapbtc/umbrel-app.yml"
+          compose="qbitleap-qbitleapbtc/docker-compose.yml"
+          current_version="$(sed -n 's/^version: "\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)"$/\1/p' "${manifest}")"
+          if [[ -z "${current_version}" ]]; then
+            echo "Could not read a semantic app version from ${manifest}" >&2
+            exit 1
+          fi
+          IFS=. read -r major minor patch <<< "${current_version}"
+          app_version="${major}.${minor}.$((patch + 1))"
+          sed -i "s/^version: \"${current_version}\"$/version: \"${app_version}\"/" "${manifest}"
+          sed -i "s|^releaseNotes:.*$|releaseNotes: \"Automatically synced qbit-mining-bootstrap upstream to ${UPSTREAM_COMMIT:0:12}.\"|" "${manifest}"
+          sed -E -i "s#(ghcr.io/qbitleap/qbitleapbtc-(dashboard|qbitd|auxpow):)[^[:space:]]+#\\1${app_version}#g" "${compose}"
+          printf 'APP_VERSION=%s\n' "${app_version}" >> "${GITHUB_ENV}"
+
       - name: Verify proposed snapshot
         if: steps.upstream.outputs.changed == 'true'
         shell: bash
@@ -82,5 +102,16 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Update qbit-mining-bootstrap upstream to ${UPSTREAM_COMMIT:0:12}"
+          git commit -m "Release ${APP_VERSION} with upstream ${UPSTREAM_COMMIT:0:12}"
           git push origin HEAD:main
+
+      - name: Build and publish release images
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run build-dashboard.yml --ref main
+          gh workflow run build-qbitd.yml --ref main
+          gh workflow run build-auxpow.yml --ref main

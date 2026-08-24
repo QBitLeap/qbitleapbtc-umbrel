@@ -1,6 +1,9 @@
 name: Build Qbit Core image
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -18,6 +21,14 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+
+      - name: Load app version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version: "\([^"]*\)"$/\1/p' qbitleap-qbitleapbtc/umbrel-app.yml)"
+          test -n "${version}"
+          printf 'APP_VERSION=%s\n' "${version}" >> "${GITHUB_ENV}"
 
       - name: Prepare pinned Qbit source
         working-directory: ${{ env.UPSTREAM_DIR }}
@@ -46,7 +57,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.IMAGE_NAME }}:0.1.0
+            ${{ env.IMAGE_NAME }}:${{ env.APP_VERSION }}
             ${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max

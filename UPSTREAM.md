@@ -18,4 +18,6 @@ pin and this document together.
 
 The scheduled upstream-update workflow checks official `main` weekly. When a
 new commit is available, it verifies the replacement snapshot, commits it, and
-pushes it directly to this repository's `main` branch.
+pushes it directly to this repository's `main` branch. The same commit increments
+the Umbrel app patch version, updates its image tags and release notes, and
+dispatches builds for all three application images.

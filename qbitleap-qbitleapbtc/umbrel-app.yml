@@ -24,9 +24,7 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 
 gallery: []
 
-releaseNotes: >-
-  Show synchronized nodes in green, nodes still synchronizing in amber with
-  progress and block height, and unavailable nodes in red.
+releaseNotes: "Show node synchronization state, progress, and availability in the dashboard."
 
 dependencies:
   - bitcoin
