@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 concurrency:
   group: update-qbit-mining-bootstrap
@@ -15,9 +14,7 @@ concurrency:
 
 env:
   UPSTREAM_REPOSITORY: https://github.com/Qbit-Org/qbit-mining-bootstrap.git
-  PINNED_COMMIT: 2cd9fa4049c2064e34285de77cce4c0731fe657d
   VENDORED_DIRECTORY: qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap
-  UPDATE_BRANCH: automation/update-qbit-mining-bootstrap
 
 jobs:
   propose-update:
@@ -28,6 +25,13 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: main
+
+      - name: Load pinned upstream commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'PINNED_COMMIT=%s\n' "$(tr -d '[:space:]' < UPSTREAM_COMMIT)" >> "${GITHUB_ENV}"
 
       - name: Fetch official upstream main
         id: upstream
@@ -55,9 +59,8 @@ jobs:
           rsync -a --delete --exclude=.git/ \
             "${RUNNER_TEMP}/qbit-mining-bootstrap/" \
             "${VENDORED_DIRECTORY}/"
+          printf '%s\n' "${UPSTREAM_COMMIT}" > UPSTREAM_COMMIT
           sed -i "s/${PINNED_COMMIT}/${UPSTREAM_COMMIT}/g" UPSTREAM.md
-          sed -i "s/${PINNED_COMMIT}/${UPSTREAM_COMMIT}/g" .github/workflows/verify-upstream.yml
-          sed -i "s/${PINNED_COMMIT}/${UPSTREAM_COMMIT}/g" .github/workflows/update-upstream.yml
 
       - name: Verify proposed snapshot
         if: steps.upstream.outputs.changed == 'true'
@@ -72,27 +75,12 @@ jobs:
             > "${RUNNER_TEMP}/vendored-tree.txt"
           diff -u "${RUNNER_TEMP}/official-tree.txt" "${RUNNER_TEMP}/vendored-tree.txt"
 
-      - name: Commit and push update branch
+      - name: Commit and push to main
         if: steps.upstream.outputs.changed == 'true'
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B "${UPDATE_BRANCH}"
           git commit -m "Update qbit-mining-bootstrap upstream to ${UPSTREAM_COMMIT:0:12}"
-          git push --force-with-lease origin "${UPDATE_BRANCH}"
-
-          existing_pr="$(gh pr list --head "${UPDATE_BRANCH}" --state open --json number --jq '.[0].number // empty')"
-          if [[ -z "${existing_pr}" ]]; then
-            gh pr create \
-              --base main \
-              --head "${UPDATE_BRANCH}" \
-              --title "Update qbit-mining-bootstrap upstream" \
-              --body "Automated proposal to update the vendored official upstream from \`${PINNED_COMMIT}\` to \`${UPSTREAM_COMMIT}\`. Review upstream changes and required Umbrel compatibility before merging."
-          else
-            gh pr comment "${existing_pr}" \
-              --body "Refreshed this proposal to official upstream commit \`${UPSTREAM_COMMIT}\`."
-          fi
+          git push origin HEAD:main

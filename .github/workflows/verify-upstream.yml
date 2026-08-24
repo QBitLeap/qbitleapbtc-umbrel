@@ -12,7 +12,6 @@ permissions:
 
 env:
   UPSTREAM_REPOSITORY: https://github.com/Qbit-Org/qbit-mining-bootstrap.git
-  UPSTREAM_COMMIT: 2cd9fa4049c2064e34285de77cce4c0731fe657d
   VENDORED_DIRECTORY: qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap
 
 jobs:
@@ -22,6 +21,12 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+
+      - name: Load pinned upstream commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'UPSTREAM_COMMIT=%s\n' "$(tr -d '[:space:]' < UPSTREAM_COMMIT)" >> "${GITHUB_ENV}"
 
       - name: Fetch pinned upstream tree
         shell: bash

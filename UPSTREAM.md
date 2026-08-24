@@ -12,10 +12,10 @@ Umbrel-specific code must remain outside the vendored directory. The upstream
 integrity workflow compares every tracked path, blob, and executable bit against
 the pinned commit.
 
-Updating upstream requires reviewing a newer official commit, replacing the
-vendored directory with that commit's tree, updating the commit above and in the
-integrity workflow, and committing those changes together.
+The machine-readable pin is stored in `UPSTREAM_COMMIT`. Updating upstream
+replaces the vendored directory with the newer official tree and updates that
+pin and this document together.
 
 The scheduled upstream-update workflow checks official `main` weekly. When a
-new commit is available, it replaces the snapshot and opens or refreshes a pull
-request. Updates are never merged automatically.
+new commit is available, it verifies the replacement snapshot, commits it, and
+pushes it directly to this repository's `main` branch.
