@@ -17,7 +17,8 @@ replaces the vendored directory with the newer official tree and updates that
 pin and this document together.
 
 The scheduled upstream-update workflow checks official `main` weekly. When a
-new commit is available, it verifies the replacement snapshot, commits it, and
-pushes it directly to this repository's `main` branch. The same commit increments
-the Umbrel app patch version, updates its image tags and release notes, and
-dispatches builds for all three application images.
+new commit is available, it verifies the replacement snapshot, runs the Umbrel
+compatibility tests, and builds all three versioned application images. Only
+after every gate succeeds does it increment the Umbrel app patch version and
+push the release commit to this repository's `main` branch. A failed gate leaves
+the published app version unchanged.

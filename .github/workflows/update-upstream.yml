@@ -1,4 +1,4 @@
-name: Propose upstream update
+name: Release upstream update
 
 on:
   schedule:
@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write
   contents: write
+  packages: write
 
 concurrency:
   group: update-qbit-mining-bootstrap
@@ -16,6 +16,11 @@ concurrency:
 env:
   UPSTREAM_REPOSITORY: https://github.com/Qbit-Org/qbit-mining-bootstrap.git
   VENDORED_DIRECTORY: qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap
+  DASHBOARD_DIRECTORY: qbitleap-qbitleapbtc/dashboard
+  AUXPOW_DIRECTORY: qbitleap-qbitleapbtc/auxpow
+  DASHBOARD_IMAGE: ghcr.io/qbitleap/qbitleapbtc-dashboard
+  QBITD_IMAGE: ghcr.io/qbitleap/qbitleapbtc-qbitd
+  AUXPOW_IMAGE: ghcr.io/qbitleap/qbitleapbtc-auxpow
 
 jobs:
   propose-update:
@@ -95,7 +100,79 @@ jobs:
             > "${RUNNER_TEMP}/vendored-tree.txt"
           diff -u "${RUNNER_TEMP}/official-tree.txt" "${RUNNER_TEMP}/vendored-tree.txt"
 
-      - name: Commit and push to main
+      - name: Verify Umbrel compatibility
+        if: steps.upstream.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' "${VENDORED_DIRECTORY}/VERSION"
+          test -f "${VENDORED_DIRECTORY}/lab/auxpow/auxpow_coordinator.py"
+          test -f "${VENDORED_DIRECTORY}/lab/auxpow/stratum_codec.py"
+          test -f "${VENDORED_DIRECTORY}/lab/auxpow/vardiff.py"
+          "${VENDORED_DIRECTORY}/scripts/prepare-qbit-source.sh"
+          test -f "${VENDORED_DIRECTORY}/generated/qbit-src/CMakeLists.txt"
+          test -f "${VENDORED_DIRECTORY}/generated/qbit-src/test/functional/test_framework/auxpow.py"
+          PYTHONPATH="${DASHBOARD_DIRECTORY}" \
+            python3 -m unittest -v "${DASHBOARD_DIRECTORY}/test_server.py"
+          PYTHONPATH="${AUXPOW_DIRECTORY}:${VENDORED_DIRECTORY}:${VENDORED_DIRECTORY}/generated/qbit-src/test/functional" \
+            python3 -m unittest -v "${AUXPOW_DIRECTORY}/test_multi_auxpow_coordinator.py"
+
+      - name: Set up Docker Buildx
+        if: steps.upstream.outputs.changed == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        if: steps.upstream.outputs.changed == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish dashboard
+        if: steps.upstream.outputs.changed == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.DASHBOARD_DIRECTORY }}
+          file: ${{ env.DASHBOARD_DIRECTORY }}/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.DASHBOARD_IMAGE }}:${{ env.APP_VERSION }}
+          cache-from: type=gha,scope=upstream-dashboard
+          cache-to: type=gha,mode=max,scope=upstream-dashboard
+
+      - name: Build and publish Qbit Core
+        if: steps.upstream.outputs.changed == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.VENDORED_DIRECTORY }}
+          file: ${{ env.VENDORED_DIRECTORY }}/docker/qbit/Dockerfile
+          build-contexts: |
+            qbit-src=${{ env.VENDORED_DIRECTORY }}/generated/qbit-src
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.QBITD_IMAGE }}:${{ env.APP_VERSION }}
+          cache-from: type=gha,scope=upstream-qbitd
+          cache-to: type=gha,mode=max,scope=upstream-qbitd
+
+      - name: Build and publish AuxPoW
+        if: steps.upstream.outputs.changed == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ env.AUXPOW_DIRECTORY }}/Dockerfile
+          build-contexts: |
+            qbit-src=${{ env.VENDORED_DIRECTORY }}/generated/qbit-src
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.AUXPOW_IMAGE }}:${{ env.APP_VERSION }}
+          cache-from: type=gha,scope=upstream-auxpow
+          cache-to: type=gha,mode=max,scope=upstream-auxpow
+
+      - name: Publish Umbrel release to main
         if: steps.upstream.outputs.changed == 'true'
         shell: bash
         run: |
@@ -104,14 +181,3 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "Release ${APP_VERSION} with upstream ${UPSTREAM_COMMIT:0:12}"
           git push origin HEAD:main
-
-      - name: Build and publish release images
-        if: steps.upstream.outputs.changed == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh workflow run build-dashboard.yml --ref main
-          gh workflow run build-qbitd.yml --ref main
-          gh workflow run build-auxpow.yml --ref main
