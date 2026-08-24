@@ -16,8 +16,8 @@ The machine-readable pin is stored in `UPSTREAM_COMMIT`. Updating upstream
 replaces the vendored directory with the newer official tree and updates that
 pin and this document together.
 
-The scheduled upstream-update workflow checks official `main` weekly. When a
-new commit is available, it verifies the replacement snapshot, runs the Umbrel
+The scheduled upstream-update workflow checks official `main` daily at 08:17
+UTC. When a new commit is available, it verifies the replacement snapshot, runs the Umbrel
 compatibility tests, and builds all three versioned application images. Only
 after every gate succeeds does it increment the Umbrel app patch version and
 push the release commit to this repository's `main` branch. A failed gate leaves
