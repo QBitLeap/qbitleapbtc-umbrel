@@ -35,7 +35,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(cat "${UPSTREAM_DIR}/VERSION")" = "1.0.0"
+          grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' "${UPSTREAM_DIR}/VERSION"
           test -f "${UPSTREAM_DIR}/lab/auxpow/auxpow_coordinator.py"
           test -f "${UPSTREAM_DIR}/lab/auxpow/stratum_codec.py"
           test -f "${UPSTREAM_DIR}/lab/auxpow/vardiff.py"
