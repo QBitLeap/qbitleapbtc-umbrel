@@ -32,6 +32,11 @@ The dashboard exists to answer one question:
 - Local ASIC miner support
 - NiceHash-compatible Stratum endpoint
 - Multiple miner support
+
+Mining endpoints:
+
+- Local ASIC miners: `stratum+tcp://<umbrel-lan-ip>:3335` (variable difficulty)
+- Rented SHA-256 hashrate: `stratum+tcp://<umbrel-lan-ip>:4335` (500,000 minimum difficulty)
 - Persistent payout addresses
 - Bitcoin block history
 - Qbit block history

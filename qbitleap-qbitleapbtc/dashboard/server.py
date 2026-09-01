@@ -27,6 +27,8 @@ QBIT_RPC_USER = os.environ.get("QBIT_RPC_USER", "qbitrpc")
 QBIT_RPC_PASSWORD = os.environ.get("QBIT_RPC_PASSWORD", "")
 AUXPOW_HOST = os.environ.get("AUXPOW_HOST", "auxpow")
 AUXPOW_PORT = int(os.environ.get("AUXPOW_PORT", "3335"))
+AUXPOW_RENTAL_HOST = os.environ.get("AUXPOW_RENTAL_HOST", "auxpow_rental")
+AUXPOW_RENTAL_PORT = int(os.environ.get("AUXPOW_RENTAL_PORT", "4335"))
 
 BITCOIN_RPC_HOST = os.environ.get("BITCOIN_RPC_HOST", "")
 BITCOIN_RPC_PORT = int(os.environ.get("BITCOIN_RPC_PORT", "8332"))
@@ -136,9 +138,9 @@ def chain_status(rpc):
         return "offline", None, None
 
 
-def auxpow_connected():
+def auxpow_connected(host=AUXPOW_HOST, port=AUXPOW_PORT):
     try:
-        with socket.create_connection((AUXPOW_HOST, AUXPOW_PORT), timeout=2):
+        with socket.create_connection((host, port), timeout=2):
             return True
     except OSError:
         return False
@@ -288,6 +290,7 @@ def render(headers, message="", error=""):
     bitcoin_state, bitcoin_height, bitcoin_progress = chain_status(bitcoin_rpc)
     fractal_state, fractal_height, fractal_progress = chain_status(fractal_rpc)
     auxpow_up = auxpow_connected()
+    auxpow_rental_up = auxpow_connected(AUXPOW_RENTAL_HOST, AUXPOW_RENTAL_PORT)
     telemetry = read_telemetry()
     workers = telemetry.get("workers", []) if telemetry else []
     history = telemetry.get("block_history", {}) if telemetry else {}
@@ -359,7 +362,7 @@ label{{display:block;font-weight:600;margin:0 0 8px}} input{{width:100%;border:1
 </style></head><body><main>
 <div class="header"><h1>QBitLeap BTC</h1><a class="refresh" href="/">Refresh</a></div>{notice}
 <details class="card" open><summary><h2>Mining Services</h2></summary><div class="card-body">
-{service_row("Qbit Core", qbit_state, f"Synchronizing {qbit_progress * 100:.2f}% · Block {qbit_height:,}" if qbit_state == "syncing" else (f"Block {qbit_height:,}" if qbit_height is not None else "Not Running"))}{service_row("Bitcoin Core", bitcoin_state, f"Synchronizing {bitcoin_progress * 100:.2f}% · Block {bitcoin_height:,}" if bitcoin_state == "syncing" else (f"Block {bitcoin_height:,}" if bitcoin_height is not None else "Not Running"))}{service_row("Fractal Bitcoin Core", fractal_state, f"Synchronizing {fractal_progress * 100:.2f}% · Block {fractal_height:,}" if fractal_state == "syncing" else (f"Block {fractal_height:,}" if fractal_height is not None else "Not Running"))}{service_row("AuxPoW Merge Mine", "ready" if auxpow_up else "offline")}
+{service_row("Qbit Core", qbit_state, f"Synchronizing {qbit_progress * 100:.2f}% · Block {qbit_height:,}" if qbit_state == "syncing" else (f"Block {qbit_height:,}" if qbit_height is not None else "Not Running"))}{service_row("Bitcoin Core", bitcoin_state, f"Synchronizing {bitcoin_progress * 100:.2f}% · Block {bitcoin_height:,}" if bitcoin_state == "syncing" else (f"Block {bitcoin_height:,}" if bitcoin_height is not None else "Not Running"))}{service_row("Fractal Bitcoin Core", fractal_state, f"Synchronizing {fractal_progress * 100:.2f}% · Block {fractal_height:,}" if fractal_state == "syncing" else (f"Block {fractal_height:,}" if fractal_height is not None else "Not Running"))}{service_row("Local AuxPoW Stratum", "ready" if auxpow_up else "offline", "Port 3335 · vardiff")}{service_row("Rental AuxPoW Stratum", "ready" if auxpow_rental_up else "offline", "Port 4335 · minimum difficulty 500,000")}
 </div></details>
 <details class="card" open><summary><h2>Local Mining Status</h2></summary><div class="card-body">
 <div class="metric-row"><span>Status</span><span class="status-text {overall_cls}">{html.escape(overall_text)}</span></div>

@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.5.3"
+version: "0.5.4"
 port: 8080
 
 description: >-
@@ -24,7 +24,7 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 
 gallery: []
 
-releaseNotes: "Automatically synced qbit-mining-bootstrap upstream to f28a6bf46afd."
+releaseNotes: "Adds separate Stratum endpoints for local ASIC miners and high-difficulty rented hashrate."
 
 dependencies:
   - bitcoin

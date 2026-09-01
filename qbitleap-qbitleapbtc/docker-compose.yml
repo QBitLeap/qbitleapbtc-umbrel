@@ -8,7 +8,7 @@ services:
       PROXY_AUTH_ADD: "false"
 
   dashboard:
-    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.3
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.4
     restart: unless-stopped
     environment:
       DASHBOARD_PORT: "8080"
@@ -26,6 +26,8 @@ services:
       FRACTAL_RPC_PASSWORD: ${APP_FRACTAL_RPC_PASS}
       AUXPOW_HOST: auxpow
       AUXPOW_PORT: "3335"
+      AUXPOW_RENTAL_HOST: auxpow_rental
+      AUXPOW_RENTAL_PORT: "4335"
       CONFIG_DIR: /config
       TELEMETRY_FILE: /telemetry/telemetry.json
     volumes:
@@ -67,7 +69,7 @@ services:
         chmod 600 /config/fractal-payout-address.txt
 
   qbitd:
-    image: ghcr.io/qbitleap/qbitleapbtc-qbitd:0.5.3
+    image: ghcr.io/qbitleap/qbitleapbtc-qbitd:0.5.4
     restart: unless-stopped
     stop_grace_period: 2m
 
@@ -124,14 +126,14 @@ services:
       start_period: 30s
 
   auxpow:
-    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.3
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.4
     restart: unless-stopped
 
     depends_on:
       qbitd:
         condition: service_healthy
 
-    environment:
+    environment: &auxpow_environment
       AUXPOW_MODE: stratum
       AUXPOW_TEMPLATE_MAX_AGE_SECONDS: "120"
       AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS: "7200"
@@ -141,16 +143,16 @@ services:
       AUXPOW_STRATUM_SHARE_DIFF: "1"
       AUXPOW_STRATUM_VARDIFF_ENABLED: "1"
       AUXPOW_STRATUM_VARDIFF_TARGET_SHARE_SECONDS: "5"
-      AUXPOW_STRATUM_VARDIFF_MIN_DIFF: "500000"
+      AUXPOW_STRATUM_VARDIFF_MIN_DIFF: "1024"
       AUXPOW_STRATUM_VARDIFF_MAX_DIFF: "4294967296"
       AUXPOW_STRATUM_VARDIFF_RETARGET_SECONDS: "120"
       AUXPOW_STRATUM_VARDIFF_MAX_STEP_FACTOR: "4"
       AUXPOW_STRATUM_VARDIFF_MAX_STEP_DOWN_FACTOR: "2"
       AUXPOW_STRATUM_VARDIFF_EWMA_ALPHA: "0.4"
       AUXPOW_STRATUM_VARDIFF_RETARGET_TOLERANCE: "0.25"
-      AUXPOW_STRATUM_VARDIFF_STARTUP_DIFF: "500000"
+      AUXPOW_STRATUM_VARDIFF_STARTUP_DIFF: "8192"
       AUXPOW_STRATUM_VARDIFF_APPLY_MODE: next_job
-      AUXPOW_STRATUM_MIN_ADVERTISED_DIFF: "500000"
+      AUXPOW_STRATUM_MIN_ADVERTISED_DIFF: "0"
       AUXPOW_STRATUM_POLL_SECONDS: "5"
       AUXPOW_STRATUM_JOB_MAX_AGE_SECONDS: "2700"
       AUXPOW_STRATUM_VERSION_MASK: 1fffe000
@@ -196,6 +198,43 @@ services:
         - CMD-SHELL
         - >-
           python3 -c "import socket; s=socket.create_connection(('127.0.0.1',3335),2); s.close()"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # Dedicated high-difficulty endpoint for rented SHA-256 hashrate. Keeping
+  # this separate lets small local miners use vardiff without breaking rental
+  # marketplace verification, which expects the first advertised difficulty
+  # to be at least 500,000.
+  auxpow_rental:
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.4
+    restart: unless-stopped
+
+    depends_on:
+      qbitd:
+        condition: service_healthy
+
+    environment:
+      <<: *auxpow_environment
+      AUXPOW_STRATUM_PORT: "4335"
+      AUXPOW_STRATUM_VARDIFF_MIN_DIFF: "500000"
+      AUXPOW_STRATUM_VARDIFF_STARTUP_DIFF: "500000"
+      AUXPOW_STRATUM_MIN_ADVERTISED_DIFF: "500000"
+      AUXPOW_TELEMETRY_FILE: /telemetry/rental/rental-telemetry.json
+
+    ports:
+      - "4335:4335"
+
+    volumes:
+      - ${APP_DATA_DIR}/config:/config:ro
+      - ${APP_DATA_DIR}/telemetry:/telemetry
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c "import socket; s=socket.create_connection(('127.0.0.1',4335),2); s.close()"
       interval: 10s
       timeout: 5s
       retries: 30
