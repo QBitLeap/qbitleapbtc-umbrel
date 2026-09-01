@@ -5,6 +5,7 @@ FROM python:3.12-alpine
 WORKDIR /app
 
 COPY server.py /app/server.py
+COPY router.py /app/router.py
 
 EXPOSE 8080
 

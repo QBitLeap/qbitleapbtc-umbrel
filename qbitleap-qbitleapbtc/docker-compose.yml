@@ -8,7 +8,7 @@ services:
       PROXY_AUTH_ADD: "false"
 
   dashboard:
-    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.4
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.5
     restart: unless-stopped
     environment:
       DASHBOARD_PORT: "8080"
@@ -25,11 +25,15 @@ services:
       FRACTAL_RPC_USER: ${APP_FRACTAL_RPC_USER}
       FRACTAL_RPC_PASSWORD: ${APP_FRACTAL_RPC_PASS}
       AUXPOW_HOST: auxpow
-      AUXPOW_PORT: "3335"
+      AUXPOW_PORT: "3336"
       AUXPOW_RENTAL_HOST: auxpow_rental
       AUXPOW_RENTAL_PORT: "4335"
+      PERMISSIONLESS_HOST: permissionless
+      PERMISSIONLESS_PORT: "3333"
       CONFIG_DIR: /config
       TELEMETRY_FILE: /telemetry/telemetry.json
+      MODE_FILE: /config/mining-mode.txt
+      ROUTER_STATUS_FILE: /telemetry/router-status.json
     volumes:
       - ${APP_DATA_DIR}/config:/config
       - ${APP_DATA_DIR}/telemetry:/telemetry:ro
@@ -63,13 +67,15 @@ services:
         touch /config/qbt-payout-address.txt
         touch /config/btc-payout-address.txt
         touch /config/fractal-payout-address.txt
+        test -s /config/mining-mode.txt || echo auxpow > /config/mining-mode.txt
         chmod 600 /config/qbit.conf
         chmod 600 /config/qbt-payout-address.txt
         chmod 600 /config/btc-payout-address.txt
         chmod 600 /config/fractal-payout-address.txt
+        chmod 600 /config/mining-mode.txt
 
   qbitd:
-    image: ghcr.io/qbitleap/qbitleapbtc-qbitd:0.5.4
+    image: ghcr.io/qbitleap/qbitleapbtc-qbitd:0.5.5
     restart: unless-stopped
     stop_grace_period: 2m
 
@@ -126,7 +132,7 @@ services:
       start_period: 30s
 
   auxpow:
-    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.4
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.5
     restart: unless-stopped
 
     depends_on:
@@ -139,7 +145,7 @@ services:
       AUXPOW_TEMPLATE_MAX_FUTURE_SECONDS: "7200"
       AUXPOW_STRATUM_REFRESH_FAILURE_EXIT_SECONDS: "120"
       AUXPOW_STRATUM_BIND: 0.0.0.0
-      AUXPOW_STRATUM_PORT: "3335"
+      AUXPOW_STRATUM_PORT: "3336"
       AUXPOW_STRATUM_SHARE_DIFF: "1"
       AUXPOW_STRATUM_VARDIFF_ENABLED: "1"
       AUXPOW_STRATUM_VARDIFF_TARGET_SHARE_SECONDS: "5"
@@ -186,9 +192,6 @@ services:
       AUXPOW_ADDRESS_POLL_SECONDS: "2"
       AUXPOW_TELEMETRY_FILE: /telemetry/telemetry.json
 
-    ports:
-      - "3335:3335"
-
     volumes:
       - ${APP_DATA_DIR}/config:/config:ro
       - ${APP_DATA_DIR}/telemetry:/telemetry
@@ -197,7 +200,7 @@ services:
       test:
         - CMD-SHELL
         - >-
-          python3 -c "import socket; s=socket.create_connection(('127.0.0.1',3335),2); s.close()"
+          python3 -c "import socket; s=socket.create_connection(('127.0.0.1',3336),2); s.close()"
       interval: 10s
       timeout: 5s
       retries: 30
@@ -208,7 +211,7 @@ services:
   # marketplace verification, which expects the first advertised difficulty
   # to be at least 500,000.
   auxpow_rental:
-    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.4
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.5
     restart: unless-stopped
 
     depends_on:
@@ -235,6 +238,73 @@ services:
         - CMD-SHELL
         - >-
           python3 -c "import socket; s=socket.create_connection(('127.0.0.1',4335),2); s.close()"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  permissionless:
+    image: ghcr.io/qbitleap/qbitleapbtc-ckpool:0.5.5
+    restart: unless-stopped
+    depends_on:
+      qbitd:
+        condition: service_healthy
+    environment:
+      QBIT_PRODUCTION: "1"
+      QBIT_TOOLS_PRODUCTION: "1"
+      QBIT_CHAIN: mainnet
+      QBIT_RPC_HOST: qbitd
+      QBIT_RPC_PORT: "8352"
+      QBIT_RPC_USER: qbitrpc
+      QBIT_RPC_PASSWORD: ${APP_PASSWORD}
+      QBIT_MINER_ADDRESS_FILE: /config/qbt-payout-address.txt
+      QBIT_MINER_ADDRESS_FILE_WAIT: "300"
+      CKPOOL_MINDIFF: "1024"
+      CKPOOL_STARTDIFF: "8192"
+      CKPOOL_MAXDIFF: "4294967296"
+      CKPOOL_STRATUM_PORT: "3333"
+      CKPOOL_PUBLIC_DIFF_POLICY: explicit
+      CKPOOL_NON_TEST_READINESS_GATE: "1"
+      CKPOOL_MIN_PEERS: "1"
+      CKPOOL_REQUIRE_P2MR_PAYOUT: "1"
+      QBIT_EXPECTED_ADDRESS_HRP: qb
+      QBIT_EXPECTED_GENESIS_HASH: 0000000000004d60aa5d46013991d0a0e2995d89ee98e53068ae196d763e79f2
+      CKPOOL_VERSION_MASK: 1fffe000
+      CKPOOL_VERSION_MASK_MODE: dynamic
+    volumes:
+      - ${APP_DATA_DIR}/config:/config:ro
+    healthcheck:
+      test: [CMD-SHELL, "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/3333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  stratum_router:
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.5
+    restart: unless-stopped
+    command: [python, /app/router.py]
+    environment:
+      ROUTER_PORT: "3335"
+      MODE_FILE: /config/mining-mode.txt
+      ROUTER_STATUS_FILE: /telemetry/router-status.json
+      QBT_ADDRESS_FILE: /config/qbt-payout-address.txt
+      AUXPOW_BACKEND_HOST: auxpow
+      AUXPOW_BACKEND_PORT: "3336"
+      PERMISSIONLESS_BACKEND_HOST: permissionless
+      PERMISSIONLESS_BACKEND_PORT: "3333"
+    ports:
+      - "3335:3335"
+    volumes:
+      - ${APP_DATA_DIR}/config:/config:ro
+      - ${APP_DATA_DIR}/telemetry:/telemetry
+    depends_on:
+      auxpow:
+        condition: service_healthy
+      permissionless:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD-SHELL, "python -c \"import socket; s=socket.create_connection(('127.0.0.1',3335),2); s.close()\""]
       interval: 10s
       timeout: 5s
       retries: 30

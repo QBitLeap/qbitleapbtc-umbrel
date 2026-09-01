@@ -37,6 +37,10 @@ Mining endpoints:
 
 - Local ASIC miners: `stratum+tcp://<umbrel-lan-ip>:3335` (variable difficulty)
 - Rented SHA-256 hashrate: `stratum+tcp://<umbrel-lan-ip>:4335` (500,000 minimum difficulty)
+
+The dashboard can switch port `3335` between AuxPoW merge mining and
+permissionless Qbit-only mining. Connected miners are automatically
+disconnected so they reconnect to the newly selected backend.
 - Persistent payout addresses
 - Bitcoin block history
 - Qbit block history

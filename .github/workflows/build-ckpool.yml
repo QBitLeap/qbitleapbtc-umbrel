@@ -1,0 +1,44 @@
+name: Build Qbit CKPool image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Load pinned versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version: "\([^"]*\)"$/\1/p' qbitleap-qbitleapbtc/umbrel-app.yml)"
+          source qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap/config/upstream.env
+          printf 'APP_VERSION=%s\nCKPOOL_GIT_URL=%s\nCKPOOL_GIT_REF=%s\n' "$version" "$CKPOOL_GIT_URL" "$CKPOOL_GIT_REF" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish CKPool
+        uses: docker/build-push-action@v7
+        with:
+          context: qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap
+          file: qbitleap-qbitleapbtc/upstream/qbit-mining-bootstrap/docker/ckpool/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            CKPOOL_GIT_URL=${{ env.CKPOOL_GIT_URL }}
+            CKPOOL_GIT_REF=${{ env.CKPOOL_GIT_REF }}
+          tags: |
+            ghcr.io/qbitleap/qbitleapbtc-ckpool:${{ env.APP_VERSION }}
+            ghcr.io/qbitleap/qbitleapbtc-ckpool:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

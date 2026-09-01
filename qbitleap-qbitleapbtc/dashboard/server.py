@@ -20,6 +20,8 @@ BTC_FILE = CONFIG_DIR / "btc-payout-address.txt"
 FRACTAL_FILE = CONFIG_DIR / "fractal-payout-address.txt"
 EXPECTED_FILE = CONFIG_DIR / "miner-expected-hashrates.json"
 TELEMETRY_FILE = Path(os.environ.get("TELEMETRY_FILE", "/telemetry/telemetry.json"))
+MODE_FILE = Path(os.environ.get("MODE_FILE", "/config/mining-mode.txt"))
+ROUTER_STATUS_FILE = Path(os.environ.get("ROUTER_STATUS_FILE", "/telemetry/router-status.json"))
 
 QBIT_RPC_HOST = os.environ.get("QBIT_RPC_HOST", "qbitd")
 QBIT_RPC_PORT = int(os.environ.get("QBIT_RPC_PORT", "8352"))
@@ -29,6 +31,8 @@ AUXPOW_HOST = os.environ.get("AUXPOW_HOST", "auxpow")
 AUXPOW_PORT = int(os.environ.get("AUXPOW_PORT", "3335"))
 AUXPOW_RENTAL_HOST = os.environ.get("AUXPOW_RENTAL_HOST", "auxpow_rental")
 AUXPOW_RENTAL_PORT = int(os.environ.get("AUXPOW_RENTAL_PORT", "4335"))
+PERMISSIONLESS_HOST = os.environ.get("PERMISSIONLESS_HOST", "permissionless")
+PERMISSIONLESS_PORT = int(os.environ.get("PERMISSIONLESS_PORT", "3333"))
 
 BITCOIN_RPC_HOST = os.environ.get("BITCOIN_RPC_HOST", "")
 BITCOIN_RPC_PORT = int(os.environ.get("BITCOIN_RPC_PORT", "8332"))
@@ -41,6 +45,20 @@ FRACTAL_RPC_USER = os.environ.get("FRACTAL_RPC_USER", "")
 FRACTAL_RPC_PASSWORD = os.environ.get("FRACTAL_RPC_PASSWORD", "")
 
 ADDRESS_RE = re.compile(r"^[A-Za-z0-9]{14,120}$")
+MINING_MODES = {"auxpow", "permissionless"}
+
+
+def read_mining_mode():
+    mode = read_text(MODE_FILE)
+    return mode if mode in MINING_MODES else "auxpow"
+
+
+def read_router_status():
+    try:
+        value = json.loads(ROUTER_STATUS_FILE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def read_text(path):
@@ -282,6 +300,7 @@ def service_row(name, state, status=""):
 
 
 def render(headers, message="", error=""):
+    mining_mode = read_mining_mode()
     qbt = html.escape(read_text(QBT_FILE), quote=True)
     btc = html.escape(read_text(BTC_FILE), quote=True)
     fractal = html.escape(read_text(FRACTAL_FILE), quote=True)
@@ -291,8 +310,11 @@ def render(headers, message="", error=""):
     fractal_state, fractal_height, fractal_progress = chain_status(fractal_rpc)
     auxpow_up = auxpow_connected()
     auxpow_rental_up = auxpow_connected(AUXPOW_RENTAL_HOST, AUXPOW_RENTAL_PORT)
+    permissionless_up = auxpow_connected(PERMISSIONLESS_HOST, PERMISSIONLESS_PORT)
     telemetry = read_telemetry()
-    workers = telemetry.get("workers", []) if telemetry else []
+    router_status = read_router_status()
+    routed_connections = int(router_status.get("active_connections", 0) or 0)
+    workers = telemetry.get("workers", []) if telemetry and mining_mode == "auxpow" else []
     history = telemetry.get("block_history", {}) if telemetry else {}
     accepted = int(telemetry.get("accepted_shares", 0)) if telemetry else 0
     rejected = int(telemetry.get("rejected_shares", 0)) if telemetry else 0
@@ -300,7 +322,9 @@ def render(headers, message="", error=""):
     last_share = max((int(worker.get("last_share_at", 0)) for worker in workers), default=0)
     expected_total = sum(float(worker.get("expected_hashrate_hs", 0) or 0) for worker in workers)
     total_rate = float(telemetry.get("current_hashrate_hs", 0) or 0) if telemetry else 0
-    if not telemetry or not workers or not last_share or int(datetime.now().timestamp()) - last_share > 180:
+    if mining_mode == "permissionless":
+        overall_cls, overall_text = ("up", "Mining Permissionless Qbit") if routed_connections else ("down", "No Miner Connected")
+    elif not telemetry or not workers or not last_share or int(datetime.now().timestamp()) - last_share > 180:
         overall_cls, overall_text = "down", "Not Mining"
     elif rejects >= 5 or (expected_total and total_rate < expected_total * 0.7):
         overall_cls, overall_text = "warn", "Needs Attention"
@@ -318,7 +342,8 @@ def render(headers, message="", error=""):
             details.insert(1, f'expected {format_hashrate(expected_rate)}')
         worker_rows.append(f'<div class="worker-row"><div class="worker-title"><span class="service-dot {cls}"></span><strong>{html.escape(str(worker.get("name","unknown")))}</strong><span class="worker-state {cls}">{html.escape(label)}</span></div><div class="worker-detail">{html.escape(" · ".join(details))}</div></div>')
     if not worker_rows:
-        worker_rows.append('<p class="muted empty">No local miners connected.</p>')
+        text = "Permissionless miner connected; per-worker share telemetry is not yet available." if mining_mode == "permissionless" and routed_connections else "No local miners connected."
+        worker_rows.append(f'<p class="muted empty">{html.escape(text)}</p>')
 
     detected_names = {
         str(worker.get("name", "")).strip()
@@ -362,15 +387,17 @@ label{{display:block;font-weight:600;margin:0 0 8px}} input{{width:100%;border:1
 </style></head><body><main>
 <div class="header"><h1>QBitLeap BTC</h1><a class="refresh" href="/">Refresh</a></div>{notice}
 <details class="card" open><summary><h2>Mining Services</h2></summary><div class="card-body">
-{service_row("Qbit Core", qbit_state, f"Synchronizing {qbit_progress * 100:.2f}% · Block {qbit_height:,}" if qbit_state == "syncing" else (f"Block {qbit_height:,}" if qbit_height is not None else "Not Running"))}{service_row("Bitcoin Core", bitcoin_state, f"Synchronizing {bitcoin_progress * 100:.2f}% · Block {bitcoin_height:,}" if bitcoin_state == "syncing" else (f"Block {bitcoin_height:,}" if bitcoin_height is not None else "Not Running"))}{service_row("Fractal Bitcoin Core", fractal_state, f"Synchronizing {fractal_progress * 100:.2f}% · Block {fractal_height:,}" if fractal_state == "syncing" else (f"Block {fractal_height:,}" if fractal_height is not None else "Not Running"))}{service_row("Local AuxPoW Stratum", "ready" if auxpow_up else "offline", "Port 3335 · vardiff")}{service_row("Rental AuxPoW Stratum", "ready" if auxpow_rental_up else "offline", "Port 4335 · minimum difficulty 500,000")}
+{service_row("Qbit Core", qbit_state, f"Synchronizing {qbit_progress * 100:.2f}% · Block {qbit_height:,}" if qbit_state == "syncing" else (f"Block {qbit_height:,}" if qbit_height is not None else "Not Running"))}{service_row("Bitcoin Core", bitcoin_state, f"Synchronizing {bitcoin_progress * 100:.2f}% · Block {bitcoin_height:,}" if bitcoin_state == "syncing" else (f"Block {bitcoin_height:,}" if bitcoin_height is not None else "Not Running"))}{service_row("Fractal Bitcoin Core", fractal_state, f"Synchronizing {fractal_progress * 100:.2f}% · Block {fractal_height:,}" if fractal_state == "syncing" else (f"Block {fractal_height:,}" if fractal_height is not None else "Not Running"))}{service_row("AuxPoW Backend", "ready" if auxpow_up else "offline", "Selectable on local port 3335")}{service_row("Permissionless Qbit Backend", "ready" if permissionless_up else "offline", "Selectable on local port 3335")}{service_row("Rental AuxPoW Stratum", "ready" if auxpow_rental_up else "offline", "Port 4335 · minimum difficulty 500,000")}
 </div></details>
 <details class="card" open><summary><h2>Local Mining Status</h2></summary><div class="card-body">
+<div class="metric-row"><span>Mining Mode</span><span class="metric-value">{"Permissionless Qbit only" if mining_mode == "permissionless" else "AuxPoW: BTC + Qbit + Fractal"}</span></div>
+<form method="post" action="/mode"><input type="hidden" name="mining_mode" value="{"auxpow" if mining_mode == "permissionless" else "permissionless"}"><button type="submit">Switch to {"AuxPoW" if mining_mode == "permissionless" else "Permissionless Qbit"}</button></form>
 <div class="metric-row"><span>Status</span><span class="status-text {overall_cls}">{html.escape(overall_text)}</span></div>
-<div class="metric-row"><span>Connected Miners</span><span class="metric-value">{int(telemetry.get("connected_workers",0)) if telemetry else 0}</span></div>
-<div class="metric-row"><span>Total Hashrate</span><span class="metric-value">{format_hashrate(total_rate)}</span></div>
+<div class="metric-row"><span>Connected Miners</span><span class="metric-value">{routed_connections}</span></div>
+<div class="metric-row"><span>Total Hashrate</span><span class="metric-value">{format_hashrate(total_rate) if mining_mode == "auxpow" else "See miner"}</span></div>
 {f'<div class="metric-row"><span>Expected Hashrate</span><span class="metric-value">{format_hashrate(expected_total)}</span></div>' if expected_total else ''}
-<div class="metric-row"><span>Rejected Shares</span><span class="metric-value">{rejects:.1f}%</span></div>
-<div class="metric-row"><span>Last Share Received</span><span class="metric-value">{age_text(last_share) if last_share else "—"}</span></div>
+<div class="metric-row"><span>Rejected Shares</span><span class="metric-value">{"{:.1f}%".format(rejects) if mining_mode == "auxpow" else "—"}</span></div>
+<div class="metric-row"><span>Last Share Received</span><span class="metric-value">{age_text(last_share) if mining_mode == "auxpow" and last_share else "—"}</span></div>
 </div></details>
 <details class="card" open><summary><h2>Connected Miners</h2></summary><div class="card-body">{''.join(worker_rows)}</div></details>
 <details class="card"><summary><h2>Qbit Blocks Found ({len(history.get("qbit",[]))})</h2></summary><div class="card-body">{block_history_rows(history.get("qbit",[]),"No Qbit blocks found yet.")}</div></details>
@@ -399,6 +426,26 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        if self.path == "/mode":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                form = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
+                mode = form.get("mining_mode", [""])[0]
+                if mode not in MINING_MODES:
+                    raise ValueError("Invalid mining mode.")
+                atomic_write(MODE_FILE, mode)
+                body = render(self.headers, message="Mining mode changed; connected miners will reconnect automatically.")
+                code = 200
+            except ValueError as exc:
+                body = render(self.headers, error=str(exc))
+                code = 400
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path != "/save":
             self.send_error(404)
             return
