@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.5.7"
+version: "0.5.8"
 port: 8080
 
 description: >-
@@ -24,7 +24,7 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 
 gallery: []
 
-releaseNotes: "Adds permissionless Qbit miner hashrate, share, rejection, last-share, and persistent block-found telemetry to the dashboard."
+releaseNotes: "Fixes permissionless share rejection by applying the payout-qualified worker identity consistently to authorization and submissions."
 
 dependencies:
   - bitcoin

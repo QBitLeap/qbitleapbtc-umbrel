@@ -8,7 +8,7 @@ services:
       PROXY_AUTH_ADD: "false"
 
   dashboard:
-    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.7
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.8
     restart: unless-stopped
     environment:
       DASHBOARD_PORT: "8080"
@@ -76,7 +76,7 @@ services:
         chmod 600 /config/mining-mode.txt
 
   qbitd:
-    image: ghcr.io/qbitleap/qbitleapbtc-qbitd:0.5.7
+    image: ghcr.io/qbitleap/qbitleapbtc-qbitd:0.5.8
     restart: unless-stopped
     stop_grace_period: 2m
 
@@ -133,7 +133,7 @@ services:
       start_period: 30s
 
   auxpow:
-    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.7
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.8
     restart: unless-stopped
 
     depends_on:
@@ -212,7 +212,7 @@ services:
   # marketplace verification, which expects the first advertised difficulty
   # to be at least 500,000.
   auxpow_rental:
-    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.7
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.8
     restart: unless-stopped
 
     depends_on:
@@ -245,7 +245,7 @@ services:
       start_period: 30s
 
   permissionless:
-    image: ghcr.io/qbitleap/qbitleapbtc-ckpool:0.5.7
+    image: ghcr.io/qbitleap/qbitleapbtc-ckpool:0.5.8
     restart: unless-stopped
     depends_on:
       qbitd:
@@ -295,7 +295,7 @@ services:
       start_period: 30s
 
   permissionless_telemetry:
-    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.7
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.8
     restart: unless-stopped
     command: [python, /app/permissionless_telemetry.py]
     environment:
@@ -316,7 +316,7 @@ services:
         condition: service_started
 
   stratum_router:
-    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.7
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.8
     restart: unless-stopped
     command: [python, /app/router.py]
     environment:

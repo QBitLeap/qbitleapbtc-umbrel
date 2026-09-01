@@ -35,6 +35,12 @@ def selected_mode():
     return mode if mode in BACKENDS else "auxpow"
 
 
+def permissionless_worker(value):
+    payout = QBT_ADDRESS_FILE.read_text(encoding="utf-8").strip()
+    worker = re.sub(r"[^A-Za-z0-9_-]", "-", str(value))[:32]
+    return payout + (f".{worker}" if worker else "")
+
+
 def permissionless_messages(buffer, data):
     buffer += data
     output = []
@@ -42,10 +48,8 @@ def permissionless_messages(buffer, data):
         line, buffer = buffer.split(b"\n", 1)
         try:
             message = json.loads(line)
-            if message.get("method") == "mining.authorize" and message.get("params"):
-                payout = QBT_ADDRESS_FILE.read_text(encoding="utf-8").strip()
-                worker = re.sub(r"[^A-Za-z0-9_-]", "-", str(message["params"][0]))[:32]
-                message["params"][0] = payout + (f".{worker}" if worker else "")
+            if message.get("method") in {"mining.authorize", "mining.submit"} and message.get("params"):
+                message["params"][0] = permissionless_worker(message["params"][0])
                 line = json.dumps(message, separators=(",", ":")).encode()
         except (OSError, ValueError, TypeError, AttributeError):
             pass
