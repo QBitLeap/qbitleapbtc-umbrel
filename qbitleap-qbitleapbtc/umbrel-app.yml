@@ -5,7 +5,7 @@ name: QBitLeap BTC
 tagline: Run Qbit merge mining on Umbrel
 icon: https://raw.githubusercontent.com/qbitleap/qbitleapbtc-umbrel/main/qbitleap-qbitleapbtc/icon.svg
 category: Bitcoin
-version: "0.5.5"
+version: "0.5.6"
 port: 8080
 
 description: >-
@@ -24,7 +24,7 @@ support: https://github.com/qbitleap/qbitleapbtc-umbrel/issues
 
 gallery: []
 
-releaseNotes: "Adds a dashboard switch between AuxPoW merge mining and permissionless Qbit mining while keeping local miners on port 3335."
+releaseNotes: "Fixes permissionless mining startup and keeps the local Stratum router available while either mining backend starts."
 
 dependencies:
   - bitcoin

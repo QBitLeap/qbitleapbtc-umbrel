@@ -8,7 +8,7 @@ services:
       PROXY_AUTH_ADD: "false"
 
   dashboard:
-    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.5
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.6
     restart: unless-stopped
     environment:
       DASHBOARD_PORT: "8080"
@@ -75,7 +75,7 @@ services:
         chmod 600 /config/mining-mode.txt
 
   qbitd:
-    image: ghcr.io/qbitleap/qbitleapbtc-qbitd:0.5.5
+    image: ghcr.io/qbitleap/qbitleapbtc-qbitd:0.5.6
     restart: unless-stopped
     stop_grace_period: 2m
 
@@ -132,7 +132,7 @@ services:
       start_period: 30s
 
   auxpow:
-    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.5
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.6
     restart: unless-stopped
 
     depends_on:
@@ -211,7 +211,7 @@ services:
   # marketplace verification, which expects the first advertised difficulty
   # to be at least 500,000.
   auxpow_rental:
-    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.5
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.6
     restart: unless-stopped
 
     depends_on:
@@ -244,7 +244,7 @@ services:
       start_period: 30s
 
   permissionless:
-    image: ghcr.io/qbitleap/qbitleapbtc-ckpool:0.5.5
+    image: ghcr.io/qbitleap/qbitleapbtc-ckpool:0.5.6
     restart: unless-stopped
     depends_on:
       qbitd:
@@ -257,8 +257,6 @@ services:
       QBIT_RPC_PORT: "8352"
       QBIT_RPC_USER: qbitrpc
       QBIT_RPC_PASSWORD: ${APP_PASSWORD}
-      QBIT_MINER_ADDRESS_FILE: /config/qbt-payout-address.txt
-      QBIT_MINER_ADDRESS_FILE_WAIT: "300"
       CKPOOL_MINDIFF: "1024"
       CKPOOL_STARTDIFF: "8192"
       CKPOOL_MAXDIFF: "4294967296"
@@ -273,6 +271,20 @@ services:
       CKPOOL_VERSION_MASK_MODE: dynamic
     volumes:
       - ${APP_DATA_DIR}/config:/config:ro
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        for attempt in $$(seq 1 300); do
+          if [[ -s /config/qbt-payout-address.txt ]]; then
+            export QBIT_MINER_ADDRESS="$$(tr -d '\r\n' < /config/qbt-payout-address.txt)"
+            exec /usr/local/bin/start-ckpool.sh
+          fi
+          sleep 1
+        done
+        echo "permissionless: timed out waiting for the Qbit payout address" >&2
+        exit 1
     healthcheck:
       test: [CMD-SHELL, "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/3333'"]
       interval: 10s
@@ -281,7 +293,7 @@ services:
       start_period: 30s
 
   stratum_router:
-    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.5
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.6
     restart: unless-stopped
     command: [python, /app/router.py]
     environment:
@@ -300,9 +312,9 @@ services:
       - ${APP_DATA_DIR}/telemetry:/telemetry
     depends_on:
       auxpow:
-        condition: service_healthy
+        condition: service_started
       permissionless:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: [CMD-SHELL, "python -c \"import socket; s=socket.create_connection(('127.0.0.1',3335),2); s.close()\""]
       interval: 10s
