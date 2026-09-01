@@ -66,6 +66,32 @@ class ExpectedHashrateTests(unittest.TestCase):
         self.assertNotIn("thor-p2", page)
         self.assertNotIn("magic-40t", page)
 
+    def test_permissionless_mode_renders_live_miner_telemetry(self):
+        now = int(server.datetime.now().timestamp())
+        telemetry = {
+            "workers": [{"name": "thor-p2", "active": True, "last_share_at": now - 60, "accepted": 20, "rejected": 1, "hashrate_hs": 10_000_000_000_000}],
+            "block_history": {"qbit": [{"found_at": now - 120, "height": 68099, "worker": "thor-p2"}]},
+            "accepted_shares": 20,
+            "rejected_shares": 1,
+            "current_hashrate_hs": 10_000_000_000_000,
+        }
+        with (
+            patch.object(server, "read_mining_mode", return_value="permissionless"),
+            patch.object(server, "read_text", return_value=""),
+            patch.object(server, "read_expected_rates", return_value={}),
+            patch.object(server, "chain_status", return_value=("ready", 1, 1.0)),
+            patch.object(server, "auxpow_connected", return_value=True),
+            patch.object(server, "read_telemetry", side_effect=[None, telemetry]),
+            patch.object(server, "read_router_status", return_value={"active_connections": 1}),
+        ):
+            page = server.render({}).decode("utf-8")
+
+        self.assertIn("10.00 TH/s", page)
+        self.assertIn("4.8%", page)
+        self.assertIn("last share 1 min ago", page)
+        self.assertIn("Qbit Blocks Found (1)", page)
+        self.assertIn("Block 68,099", page)
+
     def test_chain_status_distinguishes_ready_syncing_and_offline(self):
         self.assertEqual(
             server.chain_status(lambda _method: {

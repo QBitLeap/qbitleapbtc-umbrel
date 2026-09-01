@@ -20,6 +20,7 @@ BTC_FILE = CONFIG_DIR / "btc-payout-address.txt"
 FRACTAL_FILE = CONFIG_DIR / "fractal-payout-address.txt"
 EXPECTED_FILE = CONFIG_DIR / "miner-expected-hashrates.json"
 TELEMETRY_FILE = Path(os.environ.get("TELEMETRY_FILE", "/telemetry/telemetry.json"))
+PERMISSIONLESS_TELEMETRY_FILE = Path(os.environ.get("PERMISSIONLESS_TELEMETRY_FILE", "/telemetry/permissionless.json"))
 MODE_FILE = Path(os.environ.get("MODE_FILE", "/config/mining-mode.txt"))
 ROUTER_STATUS_FILE = Path(os.environ.get("ROUTER_STATUS_FILE", "/telemetry/router-status.json"))
 
@@ -165,9 +166,10 @@ def auxpow_connected(host=AUXPOW_HOST, port=AUXPOW_PORT):
 
 
 
-def read_telemetry():
+def read_telemetry(path=None):
+    path = TELEMETRY_FILE if path is None else path
     try:
-        data = json.loads(TELEMETRY_FILE.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("invalid telemetry")
         if int(data.get("updated_at", 0)) < int(datetime.now().timestamp()) - 15:
@@ -175,6 +177,21 @@ def read_telemetry():
         return data
     except (FileNotFoundError, ValueError, json.JSONDecodeError, OSError):
         return None
+
+
+def combined_history(*telemetries):
+    result = {"qbit": [], "fractal": [], "bitcoin": []}
+    for chain in result:
+        seen = set()
+        for telemetry in telemetries:
+            history = telemetry.get("block_history", {}) if telemetry else {}
+            for item in history.get(chain, []):
+                key = (item.get("found_at"), item.get("height"), item.get("worker"))
+                if key not in seen:
+                    result[chain].append(item)
+                    seen.add(key)
+        result[chain].sort(key=lambda item: int(item.get("found_at", 0)), reverse=True)
+    return result
 
 
 def format_hashrate(value):
@@ -311,20 +328,20 @@ def render(headers, message="", error=""):
     auxpow_up = auxpow_connected()
     auxpow_rental_up = auxpow_connected(AUXPOW_RENTAL_HOST, AUXPOW_RENTAL_PORT)
     permissionless_up = auxpow_connected(PERMISSIONLESS_HOST, PERMISSIONLESS_PORT)
-    telemetry = read_telemetry()
+    auxpow_telemetry = read_telemetry()
+    permissionless_telemetry = read_telemetry(PERMISSIONLESS_TELEMETRY_FILE)
+    telemetry = permissionless_telemetry if mining_mode == "permissionless" else auxpow_telemetry
     router_status = read_router_status()
     routed_connections = int(router_status.get("active_connections", 0) or 0)
-    workers = telemetry.get("workers", []) if telemetry and mining_mode == "auxpow" else []
-    history = telemetry.get("block_history", {}) if telemetry else {}
+    workers = telemetry.get("workers", []) if telemetry else []
+    history = combined_history(auxpow_telemetry, permissionless_telemetry)
     accepted = int(telemetry.get("accepted_shares", 0)) if telemetry else 0
     rejected = int(telemetry.get("rejected_shares", 0)) if telemetry else 0
     rejects = reject_rate(accepted, rejected)
     last_share = max((int(worker.get("last_share_at", 0)) for worker in workers), default=0)
     expected_total = sum(float(worker.get("expected_hashrate_hs", 0) or 0) for worker in workers)
     total_rate = float(telemetry.get("current_hashrate_hs", 0) or 0) if telemetry else 0
-    if mining_mode == "permissionless":
-        overall_cls, overall_text = ("up", "Mining Permissionless Qbit") if routed_connections else ("down", "No Miner Connected")
-    elif not telemetry or not workers or not last_share or int(datetime.now().timestamp()) - last_share > 180:
+    if not telemetry or not workers or not last_share or int(datetime.now().timestamp()) - last_share > 180:
         overall_cls, overall_text = "down", "Not Mining"
     elif rejects >= 5 or (expected_total and total_rate < expected_total * 0.7):
         overall_cls, overall_text = "warn", "Needs Attention"
@@ -342,8 +359,7 @@ def render(headers, message="", error=""):
             details.insert(1, f'expected {format_hashrate(expected_rate)}')
         worker_rows.append(f'<div class="worker-row"><div class="worker-title"><span class="service-dot {cls}"></span><strong>{html.escape(str(worker.get("name","unknown")))}</strong><span class="worker-state {cls}">{html.escape(label)}</span></div><div class="worker-detail">{html.escape(" · ".join(details))}</div></div>')
     if not worker_rows:
-        text = "Permissionless miner connected; per-worker share telemetry is not yet available." if mining_mode == "permissionless" and routed_connections else "No local miners connected."
-        worker_rows.append(f'<p class="muted empty">{html.escape(text)}</p>')
+        worker_rows.append('<p class="muted empty">No local miners connected.</p>')
 
     detected_names = {
         str(worker.get("name", "")).strip()
@@ -394,10 +410,10 @@ label{{display:block;font-weight:600;margin:0 0 8px}} input{{width:100%;border:1
 <form method="post" action="/mode"><input type="hidden" name="mining_mode" value="{"auxpow" if mining_mode == "permissionless" else "permissionless"}"><button type="submit">Switch to {"AuxPoW" if mining_mode == "permissionless" else "Permissionless Qbit"}</button></form>
 <div class="metric-row"><span>Status</span><span class="status-text {overall_cls}">{html.escape(overall_text)}</span></div>
 <div class="metric-row"><span>Connected Miners</span><span class="metric-value">{routed_connections}</span></div>
-<div class="metric-row"><span>Total Hashrate</span><span class="metric-value">{format_hashrate(total_rate) if mining_mode == "auxpow" else "See miner"}</span></div>
+<div class="metric-row"><span>Total Hashrate</span><span class="metric-value">{format_hashrate(total_rate)}</span></div>
 {f'<div class="metric-row"><span>Expected Hashrate</span><span class="metric-value">{format_hashrate(expected_total)}</span></div>' if expected_total else ''}
-<div class="metric-row"><span>Rejected Shares</span><span class="metric-value">{"{:.1f}%".format(rejects) if mining_mode == "auxpow" else "—"}</span></div>
-<div class="metric-row"><span>Last Share Received</span><span class="metric-value">{age_text(last_share) if mining_mode == "auxpow" and last_share else "—"}</span></div>
+<div class="metric-row"><span>Rejected Shares</span><span class="metric-value">{"{:.1f}%".format(rejects)}</span></div>
+<div class="metric-row"><span>Last Share Received</span><span class="metric-value">{age_text(last_share) if last_share else "—"}</span></div>
 </div></details>
 <details class="card" open><summary><h2>Connected Miners</h2></summary><div class="card-body">{''.join(worker_rows)}</div></details>
 <details class="card"><summary><h2>Qbit Blocks Found ({len(history.get("qbit",[]))})</h2></summary><div class="card-body">{block_history_rows(history.get("qbit",[]),"No Qbit blocks found yet.")}</div></details>

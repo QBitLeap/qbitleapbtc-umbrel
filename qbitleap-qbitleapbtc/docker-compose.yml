@@ -8,7 +8,7 @@ services:
       PROXY_AUTH_ADD: "false"
 
   dashboard:
-    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.6
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.7
     restart: unless-stopped
     environment:
       DASHBOARD_PORT: "8080"
@@ -32,6 +32,7 @@ services:
       PERMISSIONLESS_PORT: "3333"
       CONFIG_DIR: /config
       TELEMETRY_FILE: /telemetry/telemetry.json
+      PERMISSIONLESS_TELEMETRY_FILE: /telemetry/permissionless.json
       MODE_FILE: /config/mining-mode.txt
       ROUTER_STATUS_FILE: /telemetry/router-status.json
     volumes:
@@ -75,7 +76,7 @@ services:
         chmod 600 /config/mining-mode.txt
 
   qbitd:
-    image: ghcr.io/qbitleap/qbitleapbtc-qbitd:0.5.6
+    image: ghcr.io/qbitleap/qbitleapbtc-qbitd:0.5.7
     restart: unless-stopped
     stop_grace_period: 2m
 
@@ -132,7 +133,7 @@ services:
       start_period: 30s
 
   auxpow:
-    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.6
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.7
     restart: unless-stopped
 
     depends_on:
@@ -211,7 +212,7 @@ services:
   # marketplace verification, which expects the first advertised difficulty
   # to be at least 500,000.
   auxpow_rental:
-    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.6
+    image: ghcr.io/qbitleap/qbitleapbtc-auxpow:0.5.7
     restart: unless-stopped
 
     depends_on:
@@ -244,7 +245,7 @@ services:
       start_period: 30s
 
   permissionless:
-    image: ghcr.io/qbitleap/qbitleapbtc-ckpool:0.5.6
+    image: ghcr.io/qbitleap/qbitleapbtc-ckpool:0.5.7
     restart: unless-stopped
     depends_on:
       qbitd:
@@ -271,6 +272,7 @@ services:
       CKPOOL_VERSION_MASK_MODE: dynamic
     volumes:
       - ${APP_DATA_DIR}/config:/config:ro
+      - ${APP_DATA_DIR}/telemetry/permissionless-ckpool:/var/log/ckpool
     command:
       - /bin/bash
       - -lc
@@ -292,8 +294,29 @@ services:
       retries: 30
       start_period: 30s
 
+  permissionless_telemetry:
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.7
+    restart: unless-stopped
+    command: [python, /app/permissionless_telemetry.py]
+    environment:
+      CKPOOL_STATUS_FILE: /ckpool/pool/rejects.status
+      PERMISSIONLESS_TELEMETRY_FILE: /telemetry/permissionless.json
+      PERMISSIONLESS_STATE_FILE: /telemetry/permissionless-state.json
+      QBT_ADDRESS_FILE: /config/qbt-payout-address.txt
+      QBIT_RPC_HOST: qbitd
+      QBIT_RPC_PORT: "8352"
+      QBIT_RPC_USER: qbitrpc
+      QBIT_RPC_PASSWORD: ${APP_PASSWORD}
+    volumes:
+      - ${APP_DATA_DIR}/telemetry/permissionless-ckpool:/ckpool:ro
+      - ${APP_DATA_DIR}/telemetry:/telemetry
+      - ${APP_DATA_DIR}/config:/config:ro
+    depends_on:
+      permissionless:
+        condition: service_started
+
   stratum_router:
-    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.6
+    image: ghcr.io/qbitleap/qbitleapbtc-dashboard:0.5.7
     restart: unless-stopped
     command: [python, /app/router.py]
     environment:
