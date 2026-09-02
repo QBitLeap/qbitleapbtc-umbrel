@@ -57,6 +57,33 @@ def display_worker(workername):
     return workername.split(".", 1)[1] if "." in workername else workername
 
 
+def reconcile_block_history(history):
+    reconciled = []
+    positions = {}
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        block_hash = item.get("block_hash")
+        height = item.get("height")
+        key = ("height", int(height)) if height is not None else (("hash", str(block_hash)) if block_hash else None)
+        if key is None or key not in positions:
+            positions[key] = len(reconciled) if key is not None else None
+            reconciled.append(dict(item))
+            continue
+
+        current = reconciled[positions[key]]
+        current_worker = str(current.get("worker") or "")
+        incoming_worker = str(item.get("worker") or "")
+        if incoming_worker and incoming_worker != "permissionless miner":
+            current["worker"] = incoming_worker
+            current["found_at"] = item.get("found_at", current.get("found_at"))
+        elif not current_worker:
+            current["worker"] = incoming_worker
+        if block_hash:
+            current["block_hash"] = block_hash
+    return reconciled[:100]
+
+
 def rpc(method, params=None):
     payload = json.dumps({"jsonrpc": "1.0", "id": "permissionless-telemetry", "method": method, "params": params or []}).encode()
     auth = base64.b64encode(f"{QBIT_RPC_USER}:{QBIT_RPC_PASSWORD}".encode()).decode()
@@ -177,7 +204,7 @@ def snapshot(status, state, now=None):
             item["height"] = height
 
     history = state.get("block_history", []) if isinstance(state.get("block_history"), list) else []
-    history = (new_blocks + history)[:100]
+    history = reconcile_block_history(new_blocks + history)
     pool = status.get("pool", {}) if isinstance(status.get("pool"), dict) else {}
     accepted_total = int(bucket(pool, "accepted"))
     rejected_total = int(sum(bucket(pool, reason) for reason in REJECT_REASONS))

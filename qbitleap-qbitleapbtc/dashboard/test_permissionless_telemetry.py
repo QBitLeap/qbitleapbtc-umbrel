@@ -71,6 +71,48 @@ class PermissionlessTelemetryTests(unittest.TestCase):
         )
         self.assertEqual(len(result["block_history"]["qbit"]), 1)
 
+    def test_worker_confirmation_replaces_generic_chain_scan_record(self):
+        worker = {"workername": "qb1address.thor-p2", **tally(accepted=2, accepted_diff=2048, blocks=1)}
+        state = {
+            "runtime": 60,
+            "lastupdate": 2000,
+            "workers": {"qb1address.thor-p2": {"accepted": 1, "accepted_diff": 1024, "rejected": 0, "blocks": 0}},
+            "block_history": [{
+                "found_at": 1990,
+                "height": 69932,
+                "worker": "permissionless miner",
+                "block_hash": "qbit-block-hash",
+            }],
+        }
+        with patch.object(telemetry, "block_height", return_value=69932):
+            result, next_state = telemetry.snapshot(
+                {"runtime": 120, "lastupdate": 2010, "workers": [worker], "pool": tally(accepted=2, accepted_diff=2048, blocks=1)},
+                state,
+                now=2010,
+            )
+
+        self.assertEqual(len(result["block_history"]["qbit"]), 1)
+        self.assertEqual(result["block_history"]["qbit"][0], {
+            "found_at": 2010,
+            "height": 69932,
+            "worker": "thor-p2",
+            "block_hash": "qbit-block-hash",
+        })
+        self.assertEqual(next_state["block_history"], result["block_history"]["qbit"])
+
+    def test_reconciles_existing_duplicate_records(self):
+        history = [
+            {"found_at": 2010, "height": 69932, "worker": "thor-p2"},
+            {"found_at": 1990, "height": 69932, "worker": "permissionless miner", "block_hash": "qbit-block-hash"},
+        ]
+
+        self.assertEqual(telemetry.reconcile_block_history(history), [{
+            "found_at": 2010,
+            "height": 69932,
+            "worker": "thor-p2",
+            "block_hash": "qbit-block-hash",
+        }])
+
     def test_first_snapshot_uses_runtime_for_immediate_hashrate(self):
         worker = {"workername": "qb1address.rig-1", **tally(accepted=60, accepted_diff=60_000)}
         result, _ = telemetry.snapshot(
