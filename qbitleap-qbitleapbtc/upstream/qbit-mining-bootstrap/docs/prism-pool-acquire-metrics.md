@@ -116,16 +116,18 @@ unchanged.
 The coordinator database clock and chain-observation state each record one
 checkout. The latter retains its one-statement revision/epoch/tip snapshot.
 Each block-only duplicate probe and each credit/disposition poll records its
-own checkout, inside the
-original acknowledgement deadline. The two block-only probes are not issued-job
-reads. Credit and disposition still share one SQL statement and MVCC snapshot.
-Connections are released at the statement boundary, before enqueue or poll
-sleep. Missing rows, duplicates and terminal dispositions retain successful
-checkout observations; SQL errors or cancellation after acquisition do too.
-Cancellation while acquiring records a failure. Before enqueue a read failure
-is definite; after enqueue a failed or missing read does not prove whether the
-durable candidate earned credit. Timing changes neither that distinction nor
-the enqueue's existing handling of an unknown outcome.
+own checkout. Each runs in a task the acknowledgement does not own (#574), so
+neither the acknowledgement deadline nor a cancelled submission cancels its
+checkout or SQL: a checkout still waiting then records its own outcome when it
+ends, and a poll that answers after the deadline is discarded. The two
+block-only probes are not issued-job reads. Credit and disposition still share
+one SQL statement and MVCC snapshot. Connections are released at the statement
+boundary, before enqueue or poll sleep. Missing rows, duplicates and terminal
+dispositions retain successful checkout observations; SQL errors do too.
+Before enqueue a read failure is definite; after enqueue a failed or missing
+read does not prove whether the durable candidate earned credit. Timing changes
+neither that distinction nor the enqueue's existing handling of an unknown
+outcome.
 
 The server passes its existing metrics handle to the rollup loop. Each valid
 rollup attempt records one checkout before `BEGIN`; `SET LOCAL`, the single
@@ -229,6 +231,7 @@ The following exclusions are intentional and remain visible in the inventory:
 | Public HTTP reads and readiness probes | Public API: isolated read pools; the public role's metric export policy requires a separate decision. |
 | Private audit HTTP endpoints and shared API read-model helpers | Operator API: private routes can retain the run-role pool, while public dispatch substitutes its isolated read pool. These HTTP queries remain excluded even when served by the run process. |
 | Pool-only audit, partition and rollup wrappers, including `lead_rows` | Compatibility APIs: no attached metrics owner. The server uses metrics-aware maintenance; its headroom collector reads within an already timed transaction. |
+| The dual-writer health pool (3.1): the writer probe and the health reads | Dual-writer readiness: the frontend's own two-connection pool, with a 2 s acquire timeout and one retry on a fresh connection; never a checkout from the run pool, and kept out of the histogram so it stays the run pool's saturation signal. |
 
 Pool creation and idle connection replenishment are not acquisition attempts
 observed by this helper. Ledgers created without telemetry record nothing.
